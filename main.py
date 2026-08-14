@@ -478,6 +478,73 @@ def cmd_predict(args) -> None:
     print(latest[cols].to_string(index=False))
 
 
+def cmd_backtest(args) -> None:
+    """多窗口网格交易回测：窗口前段训练、末段样本外回测。"""
+    from backtest.run import run_backtest
+
+    codes = parse_codes(args.codes) if args.codes else cfg.default_codes
+    windows = (
+        [w.strip() for w in args.windows.split(",") if w.strip()]
+        if args.windows else cfg.bt_windows
+    )
+    report = run_backtest(
+        codes=codes,
+        capital=args.capital if args.capital else cfg.bt_capital,
+        windows=windows,
+        model=args.model or "baseline",
+        grid_n=args.grid_n if args.grid_n is not None else cfg.bt_grid_n,
+        range_pct=args.range_pct if args.range_pct is not None else cfg.bt_range_pct,
+        gate_on=not args.no_gate,
+        gate_threshold=args.gate_threshold
+        if args.gate_threshold is not None else cfg.bt_gate_threshold,
+        commission=args.commission if args.commission is not None else cfg.bt_commission,
+        stamp_tax=args.stamp_tax if args.stamp_tax is not None else cfg.bt_stamp_tax,
+        slippage=args.slippage if args.slippage is not None else cfg.bt_slippage,
+        train_ratio=args.train_ratio if args.train_ratio is not None else cfg.bt_train_ratio,
+        epochs=args.epochs,
+        save_every=args.save_every if args.save_every is not None else cfg.bt_save_every,
+        keep_curves=not args.no_curves,
+    )
+    if report.empty:
+        return
+    show_cols = [
+        "code", "window", "capital", "final_value", "total_return_pct",
+        "annual_return_pct", "max_drawdown_pct", "sharpe", "win_rate",
+        "n_trades", "buy_hold_return_pct", "excess_pct",
+    ]
+    show_cols = [c for c in show_cols if c in report.columns]
+    print("\n===== 回测报告（网格策略 vs 买入持有）=====")
+    print(report[show_cols].to_string(index=False))
+
+
+def cmd_factor_ic(args) -> None:
+    """因子 IC 分析：验证「当天因子 → 未来收益」的预测有效性。"""
+    from backtest.factor_eval import factor_ic_report
+    from backtest.run import ensure_data
+    from features.builder import build_dataset
+
+    codes = parse_codes(args.codes) if args.codes else cfg.default_codes
+    frames = []
+    for code in codes:
+        bars = ensure_data(code)
+        if bars is None or bars.empty:
+            logger.warning("无 %s 数据，跳过", code)
+            continue
+        sample = build_dataset(bars, window=cfg.window, horizon=args.horizon or cfg.horizon)
+        if not sample.empty:
+            frames.append(sample)
+    if not frames:
+        logger.error("无可用样本")
+        sys.exit(1)
+
+    sample_all = pd.concat(frames, ignore_index=True)
+    report = factor_ic_report(sample_all, rolling=args.rolling or 60)
+    if report.empty:
+        return
+    print("\n===== 因子 IC 报告（按 |IC 均值| 降序）=====")
+    print(report.to_string(index=False))
+
+
 # ---- 参数解析 ----
 
 
@@ -569,6 +636,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_minp.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"],
                         help="分钟线频率（默认 5）")
     p_minp.set_defaults(func=cmd_min_predict)
+
+    # backtest（多窗口网格交易回测）
+    p_bt = sub.add_parser("backtest", help="多窗口网格交易回测（含模型训练与 checkpoint）")
+    p_bt.add_argument("--codes", type=str,
+                      help="逗号分隔的股票代码，如 sh.600000,sz.000100")
+    p_bt.add_argument("--capital", type=float, help="初始资金（默认 100000）")
+    p_bt.add_argument("--windows", type=str, help="回测窗口，逗号分隔，如 5y,3y,2y,1y")
+    p_bt.add_argument("--model", type=str, choices=["baseline", "mlp", "lstm"],
+                      help="预测模型（默认 baseline）")
+    p_bt.add_argument("--grid-n", type=int, help="网格数量（默认 10）")
+    p_bt.add_argument("--range-pct", type=float, help="网格上下界幅度（默认 0.2 即 ±20%%）")
+    p_bt.add_argument("--no-gate", action="store_true", help="关闭模型信号门控（纯网格）")
+    p_bt.add_argument("--gate-threshold", type=float, help="上涨概率门控阈值（默认 0.5）")
+    p_bt.add_argument("--commission", type=float, help="佣金率（默认万 2.5）")
+    p_bt.add_argument("--stamp-tax", type=float, help="印花税，仅卖出（默认 0.05%%）")
+    p_bt.add_argument("--slippage", type=float, help="滑点比例（默认 0.1%%）")
+    p_bt.add_argument("--train-ratio", type=float, help="窗口内训练段占比（默认 0.8）")
+    p_bt.add_argument("--epochs", type=int, help="NN 训练轮数")
+    p_bt.add_argument("--save-every", type=int, help="checkpoint 保存间隔（默认 10 epoch）")
+    p_bt.add_argument("--no-curves", action="store_true", help="不保存每日资金曲线 CSV")
+    p_bt.set_defaults(func=cmd_backtest)
+
+    # factor-ic（因子有效性分析）
+    p_ic = sub.add_parser("factor-ic", help="因子 IC 分析（IC/ICIR/分层收益）")
+    p_ic.add_argument("--codes", type=str,
+                      help="逗号分隔的股票代码（>=2 只时用截面 IC，单只用滚动 IC）")
+    p_ic.add_argument("--horizon", type=int, help="未来收益周期（默认 cfg.horizon）")
+    p_ic.add_argument("--rolling", type=int, help="单股模式滚动窗口（默认 60 日）")
+    p_ic.set_defaults(func=cmd_factor_ic)
 
     # train
     p_train = sub.add_parser("train", help="训练模型")

@@ -48,6 +48,22 @@ class Config:
     # ---- 运行 ----
     device: str = "auto"                    # auto | cpu | cuda | mps
 
+    # ---- 回测（网格交易 + 多窗口）----
+    bt_capital: float = 100000.0            # 初始资金（元）
+    bt_windows: list = field(
+        default_factory=lambda: ["5y", "3y", "2y", "1y"]
+    )
+    bt_train_ratio: float = 0.8             # 窗口内训练段占比（5y 窗口 ≈ 4年训练 + 1年回测）
+    bt_grid_n: int = 10                     # 网格数量（每格资金 = capital / grid_n）
+    bt_range_pct: float = 0.20              # 网格上下界 = 回测首日收盘价 × (1±range_pct)
+    bt_gate_on: bool = True                 # 模型信号门控：预测下跌时只卖不买
+    bt_gate_threshold: float = 0.5          # 上涨概率门控阈值
+    bt_commission: float = 2.5e-4           # 佣金（双边，万 2.5）
+    bt_min_commission: float = 5.0          # 单笔最低佣金（元）
+    bt_stamp_tax: float = 5e-4              # 印花税（仅卖出，0.05%）
+    bt_slippage: float = 1e-3               # 滑点（成交价按比例偏移）
+    bt_save_every: int = 10                 # 训练 checkpoint 间隔（epoch）
+
     # 示例股票池（可扩展为全市场）
     default_codes: list = field(
         default_factory=lambda: [

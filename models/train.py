@@ -82,7 +82,15 @@ class NNTrainer:
         self.device = get_device(cfg)
         set_seed(cfg.seed)
 
-    def train(self, bundle) -> nn.Module:
+    def train(self, bundle, ckpt_dir: Optional[str] = None, save_every: int = 10) -> nn.Module:
+        """训练网络。
+
+        参数：
+            bundle    : DataBundle（train/valid 为 Dataset）
+            ckpt_dir  : checkpoint 保存目录；None 时不落盘。
+                        val loss 最优存 best.pt，每 save_every 个 epoch 存 epoch_N.pt
+            save_every: 定期 checkpoint 间隔（epoch）
+        """
         from models.nn import MLP, LSTM  # 懒加载，避免未装 torch 时导入失败
 
         cfg = self.cfg
@@ -129,6 +137,26 @@ class NNTrainer:
 
         best_valid_loss = float("inf")
         best_state = None
+        ckpt_path = None
+        if ckpt_dir is not None:
+            from pathlib import Path
+
+            ckpt_path = Path(ckpt_dir)
+            ckpt_path.mkdir(parents=True, exist_ok=True)
+
+        def _save_ckpt(path, state) -> None:
+            torch.save(
+                {
+                    "state_dict": {k: v.cpu() for k, v in state.items()},
+                    "model": cfg.model,
+                    "input_dim": input_dim,
+                    "feature_names": list(bundle.feature_names),
+                    "hidden_dim": cfg.hidden_dim,
+                    "num_layers": cfg.num_layers,
+                    "dropout": cfg.dropout,
+                },
+                path,
+            )
 
         for epoch in range(1, cfg.epochs + 1):
             net.train()
@@ -175,6 +203,14 @@ class NNTrainer:
             if val_loss < best_valid_loss:
                 best_valid_loss = val_loss
                 best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+                if ckpt_path is not None:
+                    _save_ckpt(ckpt_path / "best.pt", best_state)
+
+            if ckpt_path is not None and epoch % max(save_every, 1) == 0:
+                _save_ckpt(
+                    ckpt_path / f"epoch_{epoch}.pt",
+                    net.state_dict(),
+                )
 
         if best_state is not None:
             net.load_state_dict(best_state)
@@ -210,6 +246,68 @@ class NNTrainer:
             np.concatenate(cls_preds),
             np.concatenate(cls_scores),
         )
+
+
+def load_nn_checkpoint(path: str):
+    """加载 NN checkpoint，返回 (net, meta)。
+
+    meta 为保存时的模型结构信息（model/input_dim/feature_names 等），
+    可直接用于重建网络与对齐特征列。
+    """
+    from models.nn import build_nn
+
+    ckpt = torch.load(path, map_location="cpu")
+    meta = {k: v for k, v in ckpt.items() if k != "state_dict"}
+    # MLP 无 num_layers 参数，按模型类型裁剪构造参数
+    kwargs = {
+        "hidden_dim": meta["hidden_dim"],
+        "dropout": meta.get("dropout", 0.2),
+    }
+    if meta["model"] == "lstm":
+        kwargs["num_layers"] = meta.get("num_layers", 2)
+    net = build_nn(meta["model"], input_dim=meta["input_dim"], **kwargs)
+    net.load_state_dict(ckpt["state_dict"])
+    net.eval()
+    return net, meta
+
+
+def nn_predict(
+    net,
+    X: np.ndarray,
+    mode: str = "flat",
+    seq_len: int = 10,
+    batch_size: int = 1024,
+    device=None,
+):
+    """用 NN 模型对特征矩阵推理，返回 (pred_reg, prob_up)。
+
+    mode="seq" 时 X 视为时序特征矩阵，内部滑窗构造序列后逐样本预测。
+    """
+    if device is None:
+        device = torch.device("cpu")
+    net = net.to(device)
+    net.eval()
+
+    if mode == "seq":
+        total = len(X) - seq_len + 1
+        if total <= 0:
+            return np.array([]), np.array([])
+        batches = [
+            np.stack([X[i:i + seq_len] for i in range(s, min(s + batch_size, total))])
+            for s in range(0, total, batch_size)
+        ]
+    else:
+        batches = [X[s:s + batch_size] for s in range(0, len(X), batch_size)]
+
+    preds, probs = [], []
+    with torch.no_grad():
+        for xb in batches:
+            xs = torch.tensor(xb, dtype=torch.float32).to(device)
+            pred_reg, pred_cls_logit = net(xs)
+            preds.append(pred_reg.squeeze(1).cpu().numpy())
+            probs.append(torch.sigmoid(pred_cls_logit).squeeze(1).cpu().numpy())
+
+    return np.concatenate(preds), np.concatenate(probs)
 
 
 def predict_base_all(bundle, cfg: Config, model_path: str) -> "pd.DataFrame":
@@ -404,16 +502,31 @@ def train_min_model(bundle, cfg: Config):
     return trainer, metrics
 
 
-def train_model(bundle, cfg: Config):
-    """训练入口，根据 cfg.model 选择 NN 或基线。"""
+def train_model(
+    bundle,
+    cfg: Config,
+    ckpt_dir: Optional[str] = None,
+    save_every: int = 10,
+):
+    """训练入口，根据 cfg.model 选择 NN 或基线。
+
+    ckpt_dir 非 None 时：NN 保存 best.pt / epoch_N.pt 到该目录；
+    基线模型（无 epoch 概念）在训练后保存 best.joblib。
+    """
     if cfg.model in ("mlp", "lstm"):
         trainer = NNTrainer(cfg)
-        model = trainer.train(bundle)
+        model = trainer.train(bundle, ckpt_dir=ckpt_dir, save_every=save_every)
         return ("nn", trainer)
     if cfg.model == "baseline":
         X, y_reg, y_cls = bundle.X_y("train")
         model = BaselineEnsemble()
         model.fit(X, y_reg, y_cls)
+        if ckpt_dir is not None:
+            import joblib
+            from pathlib import Path
+
+            Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+            joblib.dump(model, Path(ckpt_dir) / "best.joblib")
         return ("baseline", model)
 
     raise ValueError(f"未知模型类型: {cfg.model}")
