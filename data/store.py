@@ -57,8 +57,9 @@ META_DIR = DATA_DIR / "meta"
 RAW_DIR = DATA_DIR / "raw"
 MIN_DIR = DATA_DIR / "raw_min"
 MIN_SAMPLES_DIR = DATA_DIR / "min_samples"
+MIN_ROLL_SAMPLES_DIR = DATA_DIR / "min_samples_roll"
 SAMPLES_DIR = DATA_DIR / "samples"
-for _d in (META_DIR, RAW_DIR, MIN_DIR, MIN_SAMPLES_DIR, SAMPLES_DIR):
+for _d in (META_DIR, RAW_DIR, MIN_DIR, MIN_SAMPLES_DIR, MIN_ROLL_SAMPLES_DIR, SAMPLES_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # baostock 支持的分钟线频率
@@ -357,6 +358,42 @@ def load_all_min_samples(frequency: str) -> pd.DataFrame:
         raise FileNotFoundError(f"min_samples 目录为空: {min_samples_dir(frequency)}")
     df = pd.read_parquet(min_samples_dir(frequency))
     logger.info("读取分钟样本分片 %d 个，共 %d 行", len(files), len(df))
+    return df
+
+
+# ---- min_samples_roll（滚动窗口分钟样本）层读写 ----
+
+
+def min_roll_samples_dir(frequency: str) -> Path:
+    """滚动分钟样本分片目录，如 frequency="5" -> cache/min_samples_roll/5"""
+    if frequency not in MIN_FREQUENCIES:
+        raise ValueError(f"不支持的分钟线频率: {frequency}，可选 {MIN_FREQUENCIES}")
+    d = MIN_ROLL_SAMPLES_DIR / frequency
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def min_roll_sample_path(code: str, frequency: str) -> Path:
+    """滚动分钟样本分片路径，如 (sz.000100, "5") -> cache/min_samples_roll/5/sz_000100.parquet"""
+    safe = code.replace(".", "_")
+    return min_roll_samples_dir(frequency) / f"{safe}.parquet"
+
+
+def save_roll_samples(df: pd.DataFrame, code: str, frequency: str) -> None:
+    """保存单只股票的滚动分钟样本分片（覆盖写）。"""
+    out = _coerce_min_samples(df, code)
+    out.to_parquet(min_roll_sample_path(code, frequency), index=False)
+
+
+def load_all_roll_samples(frequency: str) -> pd.DataFrame:
+    """读取某频率下全部滚动分钟样本分片，返回合并长表。"""
+    files = sorted(min_roll_samples_dir(frequency).glob("*.parquet"))
+    if not files:
+        raise FileNotFoundError(
+            f"min_samples_roll 目录为空: {min_roll_samples_dir(frequency)}"
+        )
+    df = pd.read_parquet(min_roll_samples_dir(frequency))
+    logger.info("读取滚动分钟样本分片 %d 个，共 %d 行", len(files), len(df))
     return df
 
 

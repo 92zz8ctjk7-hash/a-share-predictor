@@ -64,6 +64,17 @@ class Config:
     bt_slippage: float = 1e-3               # 滑点（成交价按比例偏移）
     bt_save_every: int = 10                 # 训练 checkpoint 间隔（epoch）
 
+    # ---- L5 预测输出 / 定时服务 ----
+    schedule_hour: int = 10                 # launchd 调度小时（盘中 10:00 截面后）
+    schedule_minute: int = 1                # launchd 调度分钟
+    train_hour: int = 8                     # 增量训练调度小时（开盘前）
+    train_minute: int = 30                  # 增量训练调度分钟
+    push_enabled: bool = True               # 是否推送信号
+    push_channel: str = "auto"              # 推送渠道：auto/wecom/pushplus
+    wecom_webhook: str = ""                 # 建议用 cache/.env 的 WECOM_WEBHOOK 配置
+    pushplus_token: str = ""                # 建议用 cache/.env 的 PUSHPLUS_TOKEN 配置
+    pushplus_topic: str = ""                # pushplus 一对多频道代码（群发，可选）
+
     # 示例股票池（可扩展为全市场）
     default_codes: list = field(
         default_factory=lambda: [

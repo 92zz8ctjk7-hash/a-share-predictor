@@ -82,7 +82,7 @@ class NNTrainer:
         self.device = get_device(cfg)
         set_seed(cfg.seed)
 
-    def train(self, bundle, ckpt_dir: Optional[str] = None, save_every: int = 10) -> nn.Module:
+    def train(self, bundle, ckpt_dir: Optional[str] = None, save_every: int = 10, init_state_dict=None) -> nn.Module:
         """训练网络。
 
         参数：
@@ -111,6 +111,10 @@ class NNTrainer:
             raise ValueError(f"未知 NN 模型: {cfg.model}")
 
         net = net.to(self.device)
+
+        if init_state_dict is not None:
+            net.load_state_dict(init_state_dict)
+            logger.info("warm-start：已加载预训练权重继续训练")
 
         train_mode = "seq" if seq_mode else "flat"
         if bundle.train.mode != train_mode:
@@ -382,7 +386,7 @@ class MinNNTrainer:
         self.device = get_device(cfg)
         set_seed(cfg.seed)
 
-    def train(self, bundle) -> nn.Module:
+    def train(self, bundle, init_state_dict=None) -> nn.Module:
         from models.nn import IntradayLSTM
 
         cfg = self.cfg
@@ -393,6 +397,10 @@ class MinNNTrainer:
             num_layers=cfg.num_layers,
             dropout=cfg.dropout,
         ).to(self.device)
+
+        if init_state_dict is not None:
+            net.load_state_dict(init_state_dict)
+            logger.info("warm-start：已加载分钟模型预训练权重继续训练")
 
         train_loader = DataLoader(
             bundle.train, batch_size=cfg.batch_size, shuffle=False,
@@ -490,10 +498,10 @@ class MinNNTrainer:
         )
 
 
-def train_min_model(bundle, cfg: Config):
+def train_min_model(bundle, cfg: Config, init_state_dict=None):
     """训练分钟级模型，返回 (trainer, metrics)。"""
     trainer = MinNNTrainer(cfg)
-    trainer.train(bundle)
+    trainer.train(bundle, init_state_dict=init_state_dict)
 
     y_reg_pred, y_cls_pred, y_cls_score = trainer.predict(bundle, "test")
     y_reg_true = bundle.test_df["label_rest"].to_numpy(dtype=np.float32)
@@ -507,6 +515,7 @@ def train_model(
     cfg: Config,
     ckpt_dir: Optional[str] = None,
     save_every: int = 10,
+    init_state_dict=None,
 ):
     """训练入口，根据 cfg.model 选择 NN 或基线。
 
@@ -515,7 +524,7 @@ def train_model(
     """
     if cfg.model in ("mlp", "lstm"):
         trainer = NNTrainer(cfg)
-        model = trainer.train(bundle, ckpt_dir=ckpt_dir, save_every=save_every)
+        model = trainer.train(bundle, ckpt_dir=ckpt_dir, save_every=save_every, init_state_dict=init_state_dict)
         return ("nn", trainer)
     if cfg.model == "baseline":
         X, y_reg, y_cls = bundle.X_y("train")

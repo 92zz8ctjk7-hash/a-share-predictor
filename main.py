@@ -326,7 +326,7 @@ def cmd_base_predict(args) -> None:
 def cmd_min_features(args) -> None:
     """构造分钟级样本：分钟线序列 + 日线/压力位特征 + 基座预测。"""
     from data import store
-    from features.min_builder import build_min_samples
+    from features.min_builder import build_min_samples, build_roll_samples
 
     frequency = args.frequency or cfg.min_frequency
     base_path = args.base_preds or str(DATA_DIR / "meta" / "base_preds.parquet")
@@ -334,6 +334,21 @@ def cmd_min_features(args) -> None:
         logger.error("基座预测不存在: %s，请先运行 base-predict", base_path)
         sys.exit(1)
     base_preds = pd.read_parquet(base_path)
+
+    if args.rolling:
+        # 滚动窗口样本（当前 30 分钟 → 预测下一个 30 分钟），存 min_samples_roll/
+        built = []
+        for code in store.list_min_codes(frequency):
+            sample = build_roll_samples(code, frequency, base_preds)
+            if sample is not None and not sample.empty:
+                store.save_roll_samples(sample, code, frequency)
+                built.append(code)
+                logger.info("%s 滚动样本构建完成：%d 条", code, len(sample))
+        logger.info(
+            "本次构建滚动样本 %d 只，保存在 cache/min_samples_roll/%s/",
+            len(built), frequency,
+        )
+        return
 
     built = build_min_samples(
         frequency=frequency,
@@ -377,85 +392,33 @@ def cmd_min_train(args) -> None:
 
 def cmd_min_predict(args) -> None:
     """盘中预测：拉最新分钟线 → 10:00 截面 → 输出当日收盘预测。"""
-    import numpy as np
+    from serving.predict import predict_intraday
 
-    from data.fetcher import fetch_minutes, fetch_stock
-    from features.min_builder import build_predict_input
-
-    code = args.code
-    frequency = args.frequency or cfg.min_frequency
-
-    # 1. 更新数据（分钟线 + 日线）
-    end = date.today().isoformat()
-    fetch_stock(code, start_date=cfg.start_date, end_date=end, refresh=True)
-    fetch_minutes(code, start_date=cfg.start_date, end_date=end,
-                  frequency=frequency, refresh=True)
-
-    # 2. 基座预测
-    base_pred = None
-    base_path = DATA_DIR / "meta" / "base_preds.parquet"
-    if base_path.exists():
-        base_preds = pd.read_parquet(base_path)
-        hit = base_preds[
-            (base_preds["code"] == code)
-        ].sort_values("date")
-        if not hit.empty:
-            base_pred = float(hit["base_pred"].iloc[-1])
-    if base_pred is None:
-        logger.warning("未找到基座预测（%s），base_pred 以 0 填充", code)
-
-    # 3. 构造 10:00 截面输入
-    inp = build_predict_input(code, frequency, base_pred=base_pred)
-    if inp is None:
-        sys.exit(1)
-
-    # 4. 加载模型并推理
-    try:
-        import torch
-        from models.nn import IntradayLSTM
-    except ImportError:
-        logger.error("未安装 torch，无法加载分钟模型")
-        sys.exit(1)
-
-    model_path = DATA_DIR / "models" / f"intraday_lstm_{frequency}.pt"
-    if not model_path.exists():
-        logger.error("分钟模型不存在: %s，请先运行 min-train", model_path)
-        sys.exit(1)
-    ckpt = torch.load(model_path, map_location="cpu")
-
-    net = IntradayLSTM(
-        seq_input_dim=ckpt["seq_input_dim"],
-        static_dim=len(ckpt["static_cols"]),
-        hidden_dim=cfg.hidden_dim,
-        num_layers=cfg.num_layers,
-        dropout=cfg.dropout,
+    signal = predict_intraday(
+        args.code,
+        frequency=args.frequency or cfg.min_frequency,
+        realtime=not args.no_realtime,
     )
-    net.load_state_dict(ckpt["state_dict"])
-    net.eval()
+    if signal is None:
+        sys.exit(1)
+    print(json.dumps(signal, indent=2, ensure_ascii=False))
 
-    static_vals = np.asarray(
-        [inp["static"].get(c, 0.0) for c in ckpt["static_cols"]],
-        dtype=np.float32,
-    ).reshape(1, -1)
-    x_seq = torch.tensor(inp["seq"], dtype=torch.float32)
-    x_static = torch.tensor(static_vals, dtype=torch.float32)
-    with torch.no_grad():
-        pred_reg, pred_cls_logit = net(x_seq, x_static)
-    pred_rest = float(pred_reg.squeeze(0).item())
-    prob_up = float(torch.sigmoid(pred_cls_logit).squeeze(0).item())
 
-    pred_close = inp["close10"] * (1.0 + pred_rest / 100.0)
+def cmd_serve(args) -> None:
+    """定时服务任务：预测 → 信号持久化 → 企业微信推送（手动或 launchd 触发）。"""
+    from serving.scheduler import run_daily_job
 
-    print(json.dumps({
-        "code": code,
-        "date": str(inp["date"].date()),
-        "open": round(inp["open_day"], 2),
-        "price_at_1000": round(inp["close10"], 2),
-        "predicted_change_pct_from_1000": round(pred_rest, 3),
-        "predicted_close": round(pred_close, 2),
-        "prob_close_up_from_1000": round(prob_up, 3),
-        "base_pred_pct": base_pred,
-    }, indent=2, ensure_ascii=False))
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    results = run_daily_job(codes, frequency=args.frequency, dry_run=args.dry_run)
+    logger.info("serve 完成：%d 个信号已生成", len(results))
+
+
+def cmd_install_scheduler(args) -> None:
+    """生成并安装 launchd 定时任务（工作日盘中自动出信号）。"""
+    from serving.scheduler import install_scheduler
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    install_scheduler(codes, frequency=args.frequency, load=args.load)
 
 
 def cmd_predict(args) -> None:
@@ -504,6 +467,9 @@ def cmd_backtest(args) -> None:
         epochs=args.epochs,
         save_every=args.save_every if args.save_every is not None else cfg.bt_save_every,
         keep_curves=not args.no_curves,
+        signal_source=args.signal_source or "base",
+        min_frequency=args.min_frequency or "5",
+        pretrained=args.pretrained,
     )
     if report.empty:
         return
@@ -543,6 +509,88 @@ def cmd_factor_ic(args) -> None:
         return
     print("\n===== 因子 IC 报告（按 |IC 均值| 降序）=====")
     print(report.to_string(index=False))
+
+
+def cmd_incremental_update(args) -> None:
+    """一键增量更新：刷新数据→重建样本→滚动窗口重训基座与分钟模型。"""
+    import json
+
+    from models.incremental import run_incremental_update
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    summary = run_incremental_update(
+        codes=codes,
+        base_window=args.base_window or "2y",
+        min_window=args.min_window or "12m",
+        base_model=args.base_model or "lstm",
+        base_epochs=args.base_epochs if args.base_epochs is not None else 10,
+        min_epochs=args.min_epochs if args.min_epochs is not None else 30,
+        resume=args.resume,
+        frequency=args.frequency or "5",
+    )
+    print("\n===== 增量更新完成 =====")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print("模型已更新，可用 min-predict 基于最新模型实时预测")
+
+
+def cmd_plot_equity(args) -> None:
+    """绘制回测资金曲线（需先运行过 backtest）。"""
+    from backtest.plot import plot_equity
+
+    out = plot_equity(args.code, args.window)
+    print(out)
+
+
+def cmd_rl_backtest(args) -> None:
+    """Bandit 门控 walk-forward 四模式对比回测。"""
+    from rl_gate.backtest import run_rl_backtest
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    windows = (
+        [w.strip() for w in args.windows.split(",") if w.strip()]
+        if args.windows else cfg.bt_windows
+    )
+    if args.walk:
+        from rl_gate.backtest import run_rl_walk
+
+        report = run_rl_walk(
+            codes=codes,
+            n_segments=args.segments if args.segments else 4,
+            capital=args.capital if args.capital else cfg.bt_capital,
+            model=args.model or "lstm",
+            epochs=args.epochs if args.epochs is not None else 10,
+        )
+        if report.empty:
+            return
+        seg_cols = ["code", "segment", "mode", "range", "regime", "gate_auc",
+                    "total_return_pct", "max_drawdown_pct", "sharpe", "win_rate",
+                    "n_trades", "buy_hold_return_pct", "excess_pct"]
+        agg_cols = ["code", "segment", "mode", "range", "final_value",
+                    "total_return_pct", "annual_return_pct"]
+        det = report[report["segment"] != "ALL"]
+        agg = report[report["segment"] == "ALL"]
+        print("\n===== 分段对比（每段严格样本外）=====")
+        print(det[[c for c in seg_cols if c in det.columns]].to_string(index=False))
+        print("\n===== 全周期汇总（资金跨段连续）=====")
+        print(agg[[c for c in agg_cols if c in agg.columns]].to_string(index=False))
+        return
+    report = run_rl_backtest(
+        codes=codes,
+        windows=windows,
+        capital=args.capital if args.capital else cfg.bt_capital,
+        model=args.model or "lstm",
+        epochs=args.epochs if args.epochs is not None else 10,
+    )
+    if report.empty:
+        return
+    show_cols = [
+        "code", "window", "mode", "gate_auc", "best_theta",
+        "total_return_pct", "max_drawdown_pct", "sharpe", "win_rate",
+        "n_trades", "buy_hold_return_pct", "excess_pct",
+    ]
+    show_cols = [c for c in show_cols if c in report.columns]
+    print("\n===== RL 门控四模式对比（严格样本外）=====")
+    print(report[show_cols].to_string(index=False))
 
 
 # ---- 参数解析 ----
@@ -620,6 +668,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_minf.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"],
                         help="分钟线频率（默认 5）")
     p_minf.add_argument("--base-preds", type=str, help="基座预测文件路径")
+    p_minf.add_argument("--rolling", action="store_true",
+                        help="构建滚动窗口样本（当前 30 分钟 → 预测下一个 30 分钟）")
     p_minf.add_argument("--overwrite", action="store_true", help="重建已存在的样本分片")
     p_minf.set_defaults(func=cmd_min_features)
 
@@ -635,7 +685,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_minp.add_argument("--code", type=str, required=True, help="股票代码，如 sh.600000")
     p_minp.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"],
                         help="分钟线频率（默认 5）")
+    p_minp.add_argument("--no-realtime", action="store_true",
+                        help="禁用 akshare 实时分钟源，改用 baostock 分钟线")
     p_minp.set_defaults(func=cmd_min_predict)
+
+    # serve（定时服务任务：预测→持久化→推送）
+    p_serve = sub.add_parser("serve", help="执行一次服务任务（手动或 launchd 触发）")
+    p_serve.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_serve.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"],
+                         help="分钟线频率（默认 5）")
+    p_serve.add_argument("--dry-run", action="store_true",
+                         help="只持久化并打印信号，不推送企业微信")
+    p_serve.set_defaults(func=cmd_serve)
+
+    # install-scheduler（生成并安装 launchd 定时任务）
+    p_is = sub.add_parser("install-scheduler", help="生成并安装 launchd 定时任务")
+    p_is.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_is.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"],
+                      help="分钟线频率（默认 5）")
+    p_is.add_argument("--load", action="store_true",
+                      help="安装后立即 launchctl load 启用")
+    p_is.set_defaults(func=cmd_install_scheduler)
 
     # backtest（多窗口网格交易回测）
     p_bt = sub.add_parser("backtest", help="多窗口网格交易回测（含模型训练与 checkpoint）")
@@ -655,7 +725,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--train-ratio", type=float, help="窗口内训练段占比（默认 0.8）")
     p_bt.add_argument("--epochs", type=int, help="NN 训练轮数")
     p_bt.add_argument("--save-every", type=int, help="checkpoint 保存间隔（默认 10 epoch）")
+    p_bt.add_argument("--signal-source", type=str, choices=["base", "cascade"],
+                      help="信号来源：base=日线模型（默认）；cascade=分钟模型收盘撮合+基座回退")
+    p_bt.add_argument("--min-frequency", type=str, choices=["5", "15", "30", "60"],
+                      help="cascade 模式的分钟线频率（默认 5）")
     p_bt.add_argument("--no-curves", action="store_true", help="不保存每日资金曲线 CSV")
+    p_bt.add_argument("--pretrained", action="store_true",
+                      help="直接加载已有 checkpoint（cache/models/{model}.pt）回测，不重新训练")
     p_bt.set_defaults(func=cmd_backtest)
 
     # factor-ic（因子有效性分析）
@@ -665,6 +741,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_ic.add_argument("--horizon", type=int, help="未来收益周期（默认 cfg.horizon）")
     p_ic.add_argument("--rolling", type=int, help="单股模式滚动窗口（默认 60 日）")
     p_ic.set_defaults(func=cmd_factor_ic)
+
+    # incremental-update（一键增量训练）
+    p_inc = sub.add_parser("incremental-update", help="一键增量更新（刷新数据+滚动窗口重训基座与分钟模型）")
+    p_inc.add_argument("--codes", type=str, help="分钟模型标的，逗号分隔（默认 sz.000100）")
+    p_inc.add_argument("--base-window", type=str, help="基座训练窗口，如 2y/12m/90d（默认 2y）")
+    p_inc.add_argument("--min-window", type=str, help="分钟训练窗口，如 12m/90d（默认 12m）")
+    p_inc.add_argument("--base-model", type=str, choices=["lstm", "mlp"], help="基座模型（默认 lstm）")
+    p_inc.add_argument("--base-epochs", type=int, help="基座训练轮数（默认 10）")
+    p_inc.add_argument("--min-epochs", type=int, help="分钟模型训练轮数（默认 30）")
+    p_inc.add_argument("--resume", action="store_true", help="加载已有权重 warm-start 继续训练")
+    p_inc.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"], help="分钟线频率（默认 5）")
+    p_inc.set_defaults(func=cmd_incremental_update)
+
+    # plot-equity（回测资金曲线绘图）
+    p_plot = sub.add_parser("plot-equity", help="绘制回测资金曲线（需先运行过 backtest）")
+    p_plot.add_argument("--code", type=str, required=True, help="股票代码，如 sz.000100")
+    p_plot.add_argument("--window", type=str, required=True,
+                        help="回测窗口，如 5y/3y/2y/1y 或 min_5")
+    p_plot.set_defaults(func=cmd_plot_equity)
+
+    # rl-backtest（Bandit 门控 walk-forward 对比）
+    p_rl = sub.add_parser("rl-backtest", help="Bandit 门控四模式对比回测（严格样本外）")
+    p_rl.add_argument("--codes", type=str, help="回测标的，逗号分隔（默认 sz.000100）")
+    p_rl.add_argument("--windows", type=str, help="回测窗口，逗号分隔（默认全部）")
+    p_rl.add_argument("--capital", type=float, help="初始资金（默认 100000）")
+    p_rl.add_argument("--model", type=str, choices=["lstm", "mlp"],
+                      help="日线信号模型（默认 lstm）")
+    p_rl.add_argument("--epochs", type=int, help="日线模型训练轮数（默认 10）")
+    p_rl.add_argument("--walk", action="store_true",
+                      help="全周期滚动 walk-forward（切多段覆盖牛熊震荡，资金跨段连续）")
+    p_rl.add_argument("--segments", type=int, help="walk 模式测试段数（默认 4）")
+    p_rl.set_defaults(func=cmd_rl_backtest)
 
     # train
     p_train = sub.add_parser("train", help="训练模型")

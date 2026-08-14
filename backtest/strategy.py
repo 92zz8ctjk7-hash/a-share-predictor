@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 
 class Strategy(ABC):
@@ -28,6 +28,7 @@ class Strategy(ABC):
         close: float,
         signal: Optional[Dict[str, float]],
         cur_lots: int,
+        day=None,
     ) -> int:
         """依据 T 日收盘价与信号给出目标持仓格数（T+1 开盘执行）。"""
 
@@ -41,11 +42,14 @@ class GridStrategy(Strategy):
         range_pct: float = 0.20,
         gate_on: bool = True,
         gate_threshold: float = 0.5,
+        buy_gate: Optional[Callable] = None,
     ):
         self.grid_n = grid_n
         self.range_pct = range_pct
         self.gate_on = gate_on
         self.gate_threshold = gate_threshold
+        # 外部门控（如 RL gate）：buy_gate(day) 返回 False 时禁止买入，只卖不买
+        self.buy_gate = buy_gate
         self.base_price = 0.0
         self.lower = 0.0
         self.upper = 0.0
@@ -71,6 +75,7 @@ class GridStrategy(Strategy):
         close: float,
         signal: Optional[Dict[str, float]],
         cur_lots: int,
+        day=None,
     ) -> int:
         # 突破上界：全部止盈
         if close > self.upper:
@@ -85,6 +90,11 @@ class GridStrategy(Strategy):
         # 模型门控：预测下跌（prob_up < 阈值）时只卖不买
         if self.gate_on and signal is not None:
             if signal.get("prob_up", 0.5) < self.gate_threshold:
+                pos = min(pos, cur_lots)
+
+        # 外部门控（RL gate）：禁止买入时只卖不买
+        if self.buy_gate is not None and day is not None:
+            if not self.buy_gate(day):
                 pos = min(pos, cur_lots)
 
         return pos

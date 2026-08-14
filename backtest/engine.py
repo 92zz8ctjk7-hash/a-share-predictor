@@ -55,6 +55,8 @@ class Account:
         self.n_win_sells = 0
         self.n_lose_sells = 0
         self.total_cost = 0.0
+        # 交易明细日志（每笔买卖一条）
+        self.trades: List[Dict] = []
 
     # ---- 持仓 ----
 
@@ -86,6 +88,17 @@ class Account:
         self.total_cost += commission
         self.lots.append(_Lot(shares=shares, buy_date=day, buy_price=fill_price))
         self.n_buy_trades += 1
+        self.trades.append(
+            {
+                "date": day,
+                "side": "buy",
+                "shares": shares,
+                "price": round(fill_price, 3),
+                "amount": round(amount, 2),
+                "fee": round(commission, 2),
+                "cash_after": round(self.cash, 2),
+            }
+        )
         return True
 
     def sell(self, shares: int, price: float, day: pd.Timestamp) -> int:
@@ -95,6 +108,7 @@ class Account:
         fill_price = price * (1 - self.cost.slippage)
         remaining = shares
         sold = 0
+        sell_fee = 0.0
         while remaining > 0 and self.lots:
             lot = self.lots[0]
             if lot.buy_date >= day:
@@ -108,6 +122,7 @@ class Account:
 
             self.cash += amount - commission - tax
             self.total_cost += commission + tax
+            sell_fee += commission + tax
 
             # 胜负统计（与批次买价比较，已含滑点）
             if fill_price > lot.buy_price:
@@ -123,6 +138,17 @@ class Account:
 
         if sold > 0:
             self.n_sell_trades += 1
+            self.trades.append(
+                {
+                    "date": day,
+                    "side": "sell",
+                    "shares": sold,
+                    "price": round(fill_price, 3),
+                    "amount": round(sold * fill_price, 2),
+                    "fee": round(sell_fee, 2),
+                    "cash_after": round(self.cash, 2),
+                }
+            )
         return sold
 
 
@@ -132,6 +158,7 @@ class BacktestResult:
 
     stats: Dict[str, float] = field(default_factory=dict)
     equity_curve: Optional[pd.DataFrame] = None
+    trades: Optional[pd.DataFrame] = None
 
 
 def _perf_stats(
@@ -184,28 +211,32 @@ def run_engine(
 
     参数：
         bars          : 单股日线，按 date 升序，含 date/open/close
-        signals       : 模型信号表（date/pred_reg/prob_up），T 日行在 T+1 生效；
+        signals       : 模型信号表（date/pred_reg/prob_up[/timing]）；
+                        timing="next_open"（默认）：T 日信号在 T+1 开盘撮合；
+                        timing="close"：T 日信号在 T 日收盘撮合（分钟级信号可用）；
                         某日缺信号时按无信号处理（策略自行决定门控行为）
         strategy      : 策略对象，需实现 target_lots(close, signal, cur_lots) -> int
         capital       : 初始资金
         cost          : 成本模型
         shares_per_lot: 每格固定股数；None 时按 capital/grid_n 首次买入价折算整手
 
-    流程：第 i 日的开盘撮合依据第 i-1 日收盘价与信号计算的目标格数，
-    与当前格数的差额决定买卖；收盘记录资金曲线。
+    流程：第 i 日开盘执行 i-1 日的 next_open 信号，收盘执行 i 日的 close 信号，
+    收盘后记录资金曲线；T+1 规则不变（当日买入批次当日不可卖）。
     """
     cost = cost or CostConfig()
     bars = bars.sort_values("date").reset_index(drop=True)
     if bars.empty or len(bars) < 2:
         return BacktestResult(stats={"error": "bars 不足"})
 
-    # 信号按日期索引，便于查找
+    # 信号按日期索引，便于查找（timing 缺省为 next_open，向后兼容）
     sig_map = {}
     if signals is not None and not signals.empty:
+        has_timing = "timing" in signals.columns
         for _, r in signals.iterrows():
             sig_map[r["date"]] = {
                 "pred_reg": float(r.get("pred_reg", 0.0)),
                 "prob_up": float(r.get("prob_up", 0.5)),
+                "timing": str(r["timing"]) if has_timing else "next_open",
             }
 
     # 网格以回测首日收盘价为基准
@@ -215,33 +246,43 @@ def run_engine(
     lot_shares = shares_per_lot  # 延迟到首笔买入时初始化
     curve = []
 
+    def _rebalance(ref_close: float, sig: Optional[dict], price: float, day) -> None:
+        """按参考价与信号计算目标格数并撮合差额（day 供外部门控使用）。"""
+        nonlocal lot_shares
+        cur_lots = account.lots_count
+        target = strategy.target_lots(ref_close, sig, cur_lots, day=day)
+
+        if lot_shares is None:
+            per_lot_cash = capital / max(strategy.grid_n, 1)
+            lot_shares = max(int(per_lot_cash / price / LOT_SHARES), 1) * LOT_SHARES
+
+        if target > cur_lots:
+            # 逐格买入（现金不足时停止）
+            for _ in range(target - cur_lots):
+                if not account.buy(lot_shares, price, day):
+                    break
+        elif target < cur_lots:
+            # 逐格卖出（T+1 限制下卖不掉的保留）
+            for _ in range(cur_lots - target):
+                if account.sell(lot_shares, price, day) == 0:
+                    break
+
     for i in range(len(bars)):
         row = bars.iloc[i]
         day, open_px, close_px = row["date"], float(row["open"]), float(row["close"])
 
-        # ---- 开盘：按昨日收盘信号调整持仓 ----
+        # ---- 开盘：执行昨日 next_open 信号 ----
         if i > 0:
-            prev_close = float(bars["close"].iloc[i - 1])
             prev_day = bars["date"].iloc[i - 1]
+            prev_close = float(bars["close"].iloc[i - 1])
             sig = sig_map.get(prev_day)
+            if sig is None or sig["timing"] == "next_open":
+                _rebalance(prev_close, sig, open_px, day)
 
-            cur_lots = account.lots_count
-            target = strategy.target_lots(prev_close, sig, cur_lots)
-
-            if lot_shares is None:
-                per_lot_cash = capital / max(strategy.grid_n, 1)
-                lot_shares = max(int(per_lot_cash / open_px / LOT_SHARES), 1) * LOT_SHARES
-
-            if target > cur_lots:
-                # 逐格买入（现金不足时停止）
-                for _ in range(target - cur_lots):
-                    if not account.buy(lot_shares, open_px, day):
-                        break
-            elif target < cur_lots:
-                # 逐格卖出（T+1 限制下卖不掉的保留）
-                for _ in range(cur_lots - target):
-                    if account.sell(lot_shares, open_px, day) == 0:
-                        break
+        # ---- 收盘：执行今日 close 信号 ----
+        sig_today = sig_map.get(day)
+        if sig_today is not None and sig_today["timing"] == "close":
+            _rebalance(close_px, sig_today, close_px, day)
 
         # ---- 收盘：记录资金曲线 ----
         curve.append(
@@ -263,4 +304,16 @@ def run_engine(
     buy_hold = float(bars["close"].iloc[-1] / bars["open"].iloc[0] - 1.0)
 
     stats = _perf_stats(account, total_arr, capital, len(bars) - 1, buy_hold)
-    return BacktestResult(stats=stats, equity_curve=curve_df)
+    trades_df = pd.DataFrame(account.trades)
+    if not trades_df.empty:
+        # 追加持仓与总资产快照，展示每笔交易后的账户状态
+        trades_df["lots_after"] = account_shares_snapshot(trades_df, curve_df)
+    return BacktestResult(stats=stats, equity_curve=curve_df, trades=trades_df)
+
+
+def account_shares_snapshot(
+    trades_df: pd.DataFrame, curve_df: pd.DataFrame
+) -> List[int]:
+    """按交易日期从资金曲线取持仓股数快照（展示用）。"""
+    shares_by_date = dict(zip(curve_df["date"], curve_df["shares"]))
+    return [int(shares_by_date.get(d, 0)) for d in trades_df["date"]]

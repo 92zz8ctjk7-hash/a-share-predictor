@@ -290,15 +290,163 @@ def build_min_samples(
     return built
 
 
+# ---- 滚动窗口样本：当前 30 分钟窗口 → 预测下一个 30 分钟涨跌 ----
+
+# 滚动步长 = 窗口长度（6 根 bar = 30 分钟，不重叠），每天约 7 条样本
+ROLL_STEP = SEQ_LEN
+
+
+def _window_seq_features(
+    day_bars: pd.DataFrame,
+    start_idx: int,
+    preclose: float,
+    vol_mean_by_time: pd.Series,
+) -> np.ndarray:
+    """计算任意连续 SEQ_LEN 根 bar 的序列特征（10:00 截面的泛化版）。
+
+    day_bars        : 当日全部 bar，按 time 升序，index 0..n-1
+    start_idx       : 窗口起始位置
+    preclose        : 当日前收盘价
+    vol_mean_by_time: Series，index=hhmm，前 5 日各时点均量
+    """
+    win = day_bars.iloc[start_idx:start_idx + SEQ_LEN]
+    open_day = float(day_bars["open"].iloc[0])
+    closes = win["close"].to_numpy(dtype=np.float64)
+    highs = win["high"].to_numpy(dtype=np.float64)
+    lows = win["low"].to_numpy(dtype=np.float64)
+    volumes = win["volume"].to_numpy(dtype=np.float64)
+
+    # ret：相对前一根 bar（窗口首根为当日开盘首根时相对前收）
+    if start_idx == 0:
+        prev = np.concatenate([[preclose], closes[:-1]])
+    else:
+        prev = np.concatenate(
+            [[float(day_bars["close"].iloc[start_idx - 1])], closes[:-1]]
+        )
+    ret = closes / prev - 1.0
+
+    vs_open = closes / open_day - 1.0
+
+    # vol_ratio：相对前 5 日同 hhmm 时点均量
+    hhmms = win["time"].dt.strftime("%H:%M")
+    vol_ratio = np.asarray(
+        [volumes[i] / vol_mean_by_time.get(t, np.nan) for i, t in enumerate(hhmms)],
+        dtype=np.float64,
+    )
+
+    amplitude = (highs - lows) / open_day
+
+    return np.stack([ret, vs_open, vol_ratio, amplitude], axis=1)
+
+
+def build_roll_samples(
+    code: str,
+    frequency: str,
+    base_preds: Optional[pd.DataFrame] = None,
+) -> Optional[pd.DataFrame]:
+    """构造滚动窗口分钟样本：当前 30 分钟窗口预测下一个 30 分钟涨跌。
+
+    - 滚动步长 6 根 bar（30 分钟，不重叠），每天约 7 条样本
+    - 标签 label_rest：下一窗口末 bar 收盘 / 当前窗口末 bar 收盘 - 1（%）
+    - 静态特征与 build_min_samples 一致（T-1 日线 + 压力位 + base_pred），
+      不注入宏观/基本面特征，保证与 build_predict_input 推理特征完全对齐
+    - 午间休市：bar 序列天然连续，跨午休窗口（预测午后前 30 分钟）保留
+
+    列结构与 build_min_samples 同构（MIN_SEQ_COLUMNS + 静态列 + label_rest 等），
+    可直接复用 build_min_bundle / train_min_model。无数据时返回 None。
+    """
+    min_df = store.load_min_bars(code, frequency)
+    daily_df = store.load_bars(code)
+    if min_df is None or min_df.empty or daily_df is None or daily_df.empty:
+        logger.warning("跳过 %s：分钟线或日线数据缺失", code)
+        return None
+
+    if base_preds is None or base_preds.empty:
+        logger.warning("未提供基座预测 base_preds，无法构造滚动样本")
+        return None
+    base_preds = base_preds[["date", "code", "base_pred"]].dropna().reset_index(drop=True)
+
+    daily = _daily_feature_frame(daily_df)
+    if daily.empty:
+        return None
+    daily_lookup = daily.set_index("target_date")
+    daily_raw = daily_df.set_index("date")
+
+    # 全天各 hhmm 时点均量表（前 5 日滚动均值，不含当日，避免泄漏）
+    m = min_df.sort_values("time").copy()
+    m["hhmm"] = m["time"].dt.strftime("%H:%M")
+    vol_pivot = m.pivot_table(index="date", columns="hhmm", values="volume", aggfunc="last")
+    vol_mean = vol_pivot.rolling(5, min_periods=1).mean().shift(1)
+
+    static_cols = [c for c in daily.columns if c not in ("date", "target_date", "preclose")]
+
+    rows: List[Dict] = []
+    for d, g in min_df.groupby("date"):
+        g = g.sort_values("time").reset_index(drop=True)
+        n = len(g)
+        if n < SEQ_LEN * 2:
+            continue  # 不足以构成一个窗口 + 预测目标
+        if d not in daily_lookup.index or d not in daily_raw.index:
+            continue
+        stat_row = daily_lookup.loc[d]
+        static_vals = stat_row[static_cols].to_dict()
+        preclose = float(daily_raw.loc[d, "preclose"])
+        vol_mean_row = vol_mean.loc[d] if d in vol_mean.index else pd.Series(dtype=float)
+
+        # 基座预测（级联特征）
+        hit = base_preds.loc[
+            (base_preds["date"] == d) & (base_preds["code"] == code), "base_pred"
+        ]
+        if len(hit) == 0:
+            continue  # 无基座预测的日期不构造样本（与日线样本一致）
+        base_pred = float(hit.iloc[0])
+
+        for start in range(0, n - SEQ_LEN * 2 + 1, ROLL_STEP):
+            win_close = float(g["close"].iloc[start + SEQ_LEN - 1])
+            tgt_close = float(g["close"].iloc[start + SEQ_LEN * 2 - 1])
+            if win_close <= 0:
+                continue
+            label_rest = (tgt_close / win_close - 1.0) * 100.0
+
+            seq = _window_seq_features(g, start, preclose, vol_mean_row)
+            if np.isnan(seq).any():
+                continue  # 历史均量不足等导致的缺失
+
+            row = {
+                "date": d,
+                "code": code,
+                "label_rest": label_rest,
+                "label_cls_rest": int(label_rest > 0),
+            }
+            for i, f in enumerate(SEQ_FEATURES):
+                for j in range(SEQ_LEN):
+                    row[f"seq_{j}_{f}"] = float(seq[j, i])
+            for c in static_cols:
+                row[c] = static_vals[c]
+            row["base_pred"] = base_pred
+            rows.append(row)
+
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
 def build_predict_input(
     code: str,
     frequency: str,
     base_pred: Optional[float] = None,
+    realtime_min: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict]:
-    """构造单条预测输入（盘中推理用）：最新交易日的 10:00 截面。
+    """构造单条预测输入（盘中推理用）：最新交易日 T 的 10:00 截面。
 
     从缓存读取分钟线与日线，取最新交易日 T 的 10:00 前 6 根 bar，
     结合 T-1 日线特征与基座预测，返回与训练样本同构的输入。
+
+    参数：
+        realtime_min : akshare 实时分钟线（项目 schema，可选）。提供时合并其
+                       最新交易日的 bar 到缓存分钟线之上（不写缓存），
+                       并在日线尚未覆盖当日时（盘中）自动构造当日临时日线行，
+                       从而支持开盘 30 分钟即出信号。
 
     返回 dict：
         date/open_day/close10 : 交易日、当日开盘价、10:00 收盘价
@@ -312,6 +460,21 @@ def build_predict_input(
         logger.error("分钟线或日线数据缺失，请先运行 fetch-min / fetch")
         return None
 
+    # 实时分钟线：合并其最新交易日的 bar（覆盖缓存当日旧数据）
+    if realtime_min is not None and not realtime_min.empty:
+        rt_date = realtime_min["date"].max()
+        min_df = (
+            pd.concat(
+                [
+                    min_df[min_df["date"] != rt_date],
+                    realtime_min[realtime_min["date"] == rt_date],
+                ],
+                ignore_index=True,
+            )
+            .sort_values(["date", "time"])
+            .reset_index(drop=True)
+        )
+
     daily = _daily_feature_frame(daily_df)
     if daily.empty:
         logger.error("日线特征不足（需要至少 60+ 个交易日）")
@@ -319,6 +482,39 @@ def build_predict_input(
 
     T = min_df["date"].max()
     daily_raw = daily_df.set_index("date")
+
+    # 盘中场景：当日日线尚未生成，构造临时日线行（preclose=最后收盘日收盘价，
+    # OHLC 用当日已成交 bar 填充）追加，使 target_date=T 的静态特征可用
+    if T not in daily_raw.index:
+        g_day = min_df[min_df["date"] == T]
+        if g_day.empty:
+            logger.error("交易日 %s 无分钟数据，无法构造当日日线", T.date())
+            return None
+        temp = pd.DataFrame(
+            [
+                {
+                    "date": T,
+                    "code": code,
+                    "open": float(g_day["open"].iloc[0]),
+                    "high": float(g_day["high"].max()),
+                    "low": float(g_day["low"].min()),
+                    "close": float(g_day["close"].iloc[-1]),
+                    "preclose": float(daily_df["close"].iloc[-1]),  # 昨收 = 今前收
+                    "volume": float(g_day["volume"].sum()),
+                    "amount": float(g_day["amount"].sum()),
+                    "turn": np.nan,
+                    "pct_chg": np.nan,
+                }
+            ]
+        )
+        daily_df = (
+            pd.concat([daily_df, temp], ignore_index=True)
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+        daily = _daily_feature_frame(daily_df)
+        daily_raw = daily_df.set_index("date")
+
     if T not in daily_raw.index:
         logger.error("日线数据未覆盖交易日 %s", T.date())
         return None
