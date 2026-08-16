@@ -79,8 +79,10 @@ def _plot_comparison(code: str, window: str, curves: Dict[str, pd.DataFrame]) ->
     plt.rcParams["font.family"] = ["Arial Unicode MS"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    colors = {"none": "#7f7f7f", "fixed": "#ff7f0e", "rolling": "#2ca02c", "gate": "#d62728"}
-    labels = {"none": "纯网格", "fixed": "固定阈值0.5", "rolling": "滚动最优θ", "gate": "Bandit门控"}
+    colors = {"none": "#7f7f7f", "fixed": "#ff7f0e", "rolling": "#2ca02c",
+              "gate": "#d62728", "dqn": "#9467bd", "hybrid": "#17becf"}
+    labels = {"none": "纯网格", "fixed": "固定阈值0.5", "rolling": "滚动最优θ",
+              "gate": "Bandit门控", "dqn": "DQN门控(RL)", "hybrid": "混合门控(regime切换)"}
 
     fig, ax = plt.subplots(figsize=(13, 7))
     ref = None
@@ -125,7 +127,7 @@ def run_rl_backtest(
     from data import store
     from features.builder import build_dataset
     from rl_gate.gate import make_buy_gate, train_gate
-    from rl_gate.opportunity import FEATURES, build_day_features, build_opportunities
+    from rl_gate.opportunity import build_day_features, build_opportunities, get_features
 
     windows = windows or cfg.bt_windows
     capital = capital if capital is not None else cfg.bt_capital
@@ -140,6 +142,7 @@ def run_rl_backtest(
     if opp_all.empty:
         logger.error("机会样本为空，无法继续")
         return pd.DataFrame()
+    feats_list = get_features(True)
 
     rows: List[Dict] = []
     for code in codes:
@@ -167,7 +170,7 @@ def run_rl_backtest(
             )
 
             # 1. gate 训练（沪深 300 联合，仅 cutoff 前）
-            gate_bundle = train_gate(opp_all[opp_all["date"] < cutoff], FEATURES)
+            gate_bundle = train_gate(opp_all[opp_all["date"] < cutoff], feats_list)
 
             # 2. 日线 LSTM 训练段重训 → 全窗口信号
             ckpt_dir = DATA_DIR / "models" / "checkpoints" / f"rl_{code}_{model}_{window}"
@@ -294,8 +297,59 @@ def _train_and_predict_segment(
     )
 
 
+def _build_envs(
+    codes, before_date, grid_n, range_pct, capital, cost,
+    include_market, min_days: int = 250,
+) -> Dict:
+    """构建多股票网格环境（仅用 before_date 之前的数据，供 DQN 训练）。"""
+    from data import store
+    from rl_gate.env import GridBacktestEnv
+    from rl_gate.opportunity import build_day_features
+
+    envs = {}
+    for code in codes:
+        bars = store.load_bars(code)
+        if bars is None or bars.empty:
+            continue
+        bars_pre = bars[bars["date"] < before_date]
+        if len(bars_pre) < min_days:
+            continue
+        feats = build_day_features(bars_pre, with_market=include_market)
+        envs[code] = GridBacktestEnv(
+            bars_pre, feats, grid_n=grid_n, range_pct=range_pct,
+            capital=capital, cost=cost,
+        )
+    return envs
+
+
+def _run_hybrid_episode(
+    env, dqn_agent, logistic_buy_gate, regime_by_date, trend_th: float
+) -> Tuple[pd.DataFrame, object]:
+    """混合门控：趋势日用 logistic 决策，震荡日用 DQN 决策，同一 env 执行。
+
+    结合两者优势：logistic 在趋势市稳定，DQN 在震荡市风险调整后最优。
+    regime 由 |idx_ret_20d| > trend_th 判定（True=趋势市）。
+    """
+    s = env.reset()
+    done = False
+    rows: List[Dict] = []
+    while not done:
+        day_t = env.bars["date"].iloc[env.t]
+        is_trend = regime_by_date.get(day_t, False)
+        if is_trend:  # 趋势市 → logistic
+            a = 1 if logistic_buy_gate(day_t) else 0
+            pol = "logistic"
+        else:  # 震荡市 → DQN
+            a = dqn_agent.act(s, explore=False)
+            pol = "dqn"
+        s, r, done, info = env.step(a)
+        info["policy"] = pol
+        rows.append(info)
+    return pd.DataFrame(rows), env
+
+
 def _plot_walk_comparison(
-    code: str, seg_curves: List[Dict], seg_info: List[Dict]
+    code: str, seg_curves: List[Dict], seg_info: List[Dict], out_suffix: str = ""
 ) -> None:
     """每段一个子图，四模式曲线 + 买入持有，标注 regime。"""
     try:
@@ -338,7 +392,7 @@ def _plot_walk_comparison(
             ax.legend(loc="upper left", fontsize=9)
     fig.suptitle(f"{code} 全周期滚动 walk-forward：四模式门控对比（每段严格样本外）", y=1.0)
     plt.tight_layout()
-    out = DATA_DIR / "meta" / f"equity_walk_{code}.png"
+    out = DATA_DIR / "meta" / f"equity_walk_{code}{out_suffix}.png"
     plt.savefig(out, dpi=110, bbox_inches="tight")
     plt.close(fig)
     logger.info("walk-forward 对比图已保存到 %s", out)
@@ -352,26 +406,57 @@ def run_rl_walk(
     epochs: int = 10,
     grid_n: int = 10,
     range_pct: float = 0.20,
+    include_market: bool = True,
+    include_dqn: bool = False,
+    dqn_subset: int = 60,
+    dqn_epochs: int = 5,
+    include_hybrid: bool = False,
+    trend_th: float = 0.03,
 ) -> pd.DataFrame:
     """全周期滚动 walk-forward：切 n_segments 段测试期（覆盖牛熊震荡）。
 
     每段严格用段前数据训练 gate 与 LSTM；资金跨段连续
     （上段期末资产作为下段初始资金）。输出分段对比 + 全周期汇总。
+    include_market 控制 gate 状态特征是否含市场环境因子（指数环境+日历）。
+    include_dqn 启用 DQN（真 RL，差分奖赏）门控作为第五模式。
+    include_hybrid 启用混合门控（regime 切换：震荡日用 DQN、趋势日用 logistic），
+    依赖 DQN，会自动启用 include_dqn；trend_th 为趋势判定阈值（|idx_ret_20d|）。
     """
-    from backtest.engine import CostConfig, run_engine
+    from backtest.engine import CostConfig, _perf_stats, run_engine
     from backtest.strategy import GridStrategy
     from data import store
     from features.builder import build_dataset
     from rl_gate.gate import make_buy_gate, train_gate
-    from rl_gate.opportunity import FEATURES, build_day_features, build_opportunities
+    from rl_gate.opportunity import build_day_features, build_opportunities, get_features
+
+    if include_hybrid:
+        include_dqn = True
 
     capital = capital if capital is not None else cfg.bt_capital
     cost = CostConfig()
     base_codes = _load_base_codes()
     meta_dir = DATA_DIR / "meta"
+    suffix = "" if include_market else "_no_market"
+    feats_list = get_features(include_market)
 
-    logger.info("构造沪深 300 机会样本（一次性）...")
-    opp_all = build_opportunities(base_codes)
+    modes_all = list(MODES)
+    dqn_codes = None
+    if include_dqn:
+        import random as _rnd
+
+        _rnd.seed(42)
+        dqn_codes = _rnd.sample(base_codes, min(dqn_subset, len(base_codes)))
+        modes_all.append("dqn")
+        if include_hybrid:
+            modes_all.append("hybrid")
+        logger.info("DQN 模式启用：%d 只股票子集联合训练门控（hybrid=%s）",
+                    len(dqn_codes), include_hybrid)
+
+    logger.info(
+        "构造沪深 300 机会样本（一次性，特征 %d 维，市场环境=%s）...",
+        len(feats_list), include_market,
+    )
+    opp_all = build_opportunities(base_codes, with_market=include_market)
     if opp_all.empty:
         return pd.DataFrame()
 
@@ -395,8 +480,8 @@ def run_rl_walk(
         )
 
         # 每模式跨段连续资金
-        cur_capital = {m: capital for m in MODES}
-        agg = {m: {"init": capital, "final": capital} for m in MODES}
+        cur_capital = {m: capital for m in modes_all}
+        agg = {m: {"init": capital, "final": capital} for m in modes_all}
         seg_curves, seg_info = [], []
 
         for i in range(n_segments):
@@ -415,7 +500,7 @@ def run_rl_walk(
             )
 
             # gate 训练（段前数据）
-            gate_bundle = train_gate(opp_all[opp_all["date"] < seg_start], FEATURES)
+            gate_bundle = train_gate(opp_all[opp_all["date"] < seg_start], feats_list)
 
             # LSTM 段前训练 → 段信号
             ckpt_dir = DATA_DIR / "models" / "checkpoints" / f"walk_{code}_{model}_s{i + 1}"
@@ -464,7 +549,7 @@ def run_rl_walk(
                 })
 
             # gate 模式
-            feats = build_day_features(bars)
+            feats = build_day_features(bars, with_market=include_market)
             feats_seg = feats[
                 (feats["date"] >= seg_start) & (feats["date"] <= seg_end)
             ]
@@ -491,11 +576,82 @@ def run_rl_walk(
                 "regime": regime, "bh_pct": bh * 100,
             })
 
-        _plot_walk_comparison(code, seg_curves, seg_info)
+            # DQN 模式（真 RL 门控：段前多股联合训练 → 测试段评估）
+            if include_dqn and dqn_codes:
+                from rl_gate.dqn import run_episode, train_dqn
+                from rl_gate.env import GridBacktestEnv
+
+                envs_pre = _build_envs(
+                    dqn_codes, seg_start, grid_n, range_pct,
+                    capital, cost, include_market,
+                )
+                if envs_pre:
+                    dqn_agent = train_dqn(envs_pre, epochs=dqn_epochs)
+                    feats_eval = build_day_features(
+                        bars_seg, with_market=include_market
+                    )
+                    eval_env = GridBacktestEnv(
+                        bars_seg, feats_eval, grid_n=grid_n, range_pct=range_pct,
+                        capital=cur_capital["dqn"], cost=cost,
+                    )
+                    curve, eval_env = run_episode(eval_env, dqn_agent)
+                    total_arr = curve["nav"].to_numpy(dtype=np.float64)
+                    bh_dqn = float(curve["close"].iloc[-1] / curve["close"].iloc[0] - 1)
+                    stats = _perf_stats(
+                        eval_env.account, total_arr,
+                        cur_capital["dqn"], max(len(curve) - 1, 1), bh_dqn,
+                    )
+                    cur_capital["dqn"] = stats["final_value"]
+                    agg["dqn"]["final"] = cur_capital["dqn"]
+                    seg_curves[-1]["dqn"] = curve.rename(columns={"nav": "total"})[
+                        ["date", "total", "shares", "close"]
+                    ]
+                    rows.append({
+                        "code": code, "segment": f"S{i + 1} {regime}", "mode": "dqn",
+                        "range": f"{seg_start.date()}~{seg_end.date()}",
+                        "regime": regime, "gate_auc": None, "best_theta": None,
+                        **stats,
+                    })
+
+                    # 混合模式（regime 切换：趋势日 logistic、震荡日 DQN）
+                    if include_hybrid:
+                        regime_feats = build_day_features(
+                            bars_seg, with_market=include_market
+                        )
+                        is_trend = regime_feats["idx_ret_20d"].abs() > trend_th
+                        regime_by_date = dict(zip(regime_feats["date"], is_trend))
+                        logistic_bg = make_buy_gate(gate_bundle, regime_feats)
+                        env_h = GridBacktestEnv(
+                            bars_seg, regime_feats, grid_n=grid_n, range_pct=range_pct,
+                            capital=cur_capital["hybrid"], cost=cost,
+                        )
+                        curve_h, env_h = _run_hybrid_episode(
+                            env_h, dqn_agent, logistic_bg, regime_by_date, trend_th
+                        )
+                        total_arr_h = curve_h["nav"].to_numpy(dtype=np.float64)
+                        bh_h = float(curve_h["close"].iloc[-1] / curve_h["close"].iloc[0] - 1)
+                        stats_h = _perf_stats(
+                            env_h.account, total_arr_h,
+                            cur_capital["hybrid"], max(len(curve_h) - 1, 1), bh_h,
+                        )
+                        cur_capital["hybrid"] = stats_h["final_value"]
+                        agg["hybrid"]["final"] = cur_capital["hybrid"]
+                        seg_curves[-1]["hybrid"] = curve_h.rename(columns={"nav": "total"})[
+                            ["date", "total", "shares", "close"]
+                        ]
+                        n_trend_days = int(sum(regime_by_date.values()))
+                        rows.append({
+                            "code": code, "segment": f"S{i + 1} {regime}", "mode": "hybrid",
+                            "range": f"{seg_start.date()}~{seg_end.date()}",
+                            "regime": regime, "gate_auc": None, "best_theta": trend_th,
+                            "n_trend_days": n_trend_days, **stats_h,
+                        })
+
+        _plot_walk_comparison(code, seg_curves, seg_info, out_suffix=suffix)
 
         # 全周期汇总行
         years = max((all_end - first_test).days / 365.0, 0.1)
-        for mode in MODES:
+        for mode in modes_all:
             total_ret = agg[mode]["final"] / agg[mode]["init"] - 1
             rows.append({
                 "code": code, "segment": "ALL", "mode": mode,
@@ -509,7 +665,7 @@ def run_rl_walk(
     report = pd.DataFrame(rows)
     if report.empty:
         return report
-    out = meta_dir / "rl_walk_report.csv"
+    out = meta_dir / f"rl_walk_report{suffix}.csv"
     report.to_csv(out, index=False)
     logger.info("walk-forward 报告已保存到 %s（%d 行）", out, len(report))
     return report

@@ -169,6 +169,13 @@ def build_bundle(
     # 有效特征列：以样本表实际存在的列为准（如复权模式下无 turn），
     # 并包含外部注入的特征列（宏观/图特征等）
     feature_names = _feature_cols_of(sample_df)
+    # 分片合并后，个别分片独有的列（如指数的 turn）在其他分片全为 NaN，
+    # 稀疏列会污染训练输入导致 loss=nan，这里按 NaN 占比剔除
+    nan_ratio = ordered[feature_names].isna().mean()
+    dropped = nan_ratio[nan_ratio > 0.5].index.tolist()
+    if dropped:
+        logger.warning("剔除稀疏特征列（NaN>50%%）：%s", dropped)
+        feature_names = [c for c in feature_names if c not in dropped]
     train_set = _build_one(train_df, seq_len, mode, feature_names)
     valid_set = _build_one(valid_df, seq_len, mode, feature_names)
     test_set = _build_one(test_df, seq_len, mode, feature_names)

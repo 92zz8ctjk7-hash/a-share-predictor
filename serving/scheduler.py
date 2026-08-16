@@ -85,6 +85,20 @@ def build_train_sh(codes: List[str], frequency: str) -> str:
     )
 
 
+INTRADAY_LABEL = "com.ashare.intraday-signal"
+
+
+def build_intraday_sh(codes: List[str]) -> str:
+    """生成盘中信号任务 wrapper 脚本内容：交易日 10:01 推送盘中信号。"""
+    codes_arg = ",".join(codes)
+    return (
+        "#!/bin/bash\n"
+        f"cd {ROOT}\n"
+        f"exec {ROOT}/.venv/bin/python main.py serve-intraday "
+        f"--codes {codes_arg}\n"
+    )
+
+
 def build_plist(label: str, script_path: Path, hour: int, minute: int) -> str:
     """生成 launchd plist：工作日 hour:minute 触发指定脚本。"""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -176,3 +190,43 @@ def install_scheduler(
     else:
         logger.info("未加载。启用请运行: launchctl load <plist路径>（或重新执行 --load）")
     return paths
+
+
+def install_intraday_scheduler(codes: List[str], load: bool = False) -> Path:
+    """安装盘中信号定时任务（交易日 10:01 推送拟合轨迹+强度信号）。
+
+    load=True 时立即 launchctl load。返回 plist 路径。
+    """
+    agents_dir = Path.home() / "Library" / "LaunchAgents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    script_path = DATA_DIR / f"{INTRADAY_LABEL.split('.')[-1]}.sh"
+    script_path.write_text(build_intraday_sh(codes), encoding="utf-8")
+    script_path.chmod(
+        script_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    )
+    logger.info("已生成盘中信号调度脚本 %s", script_path)
+
+    plist_path = agents_dir / f"{INTRADAY_LABEL}.plist"
+    plist_path.write_text(
+        build_plist(INTRADAY_LABEL, script_path, cfg.schedule_hour, cfg.schedule_minute),
+        encoding="utf-8",
+    )
+    logger.info(
+        "已生成盘中信号 LaunchAgent %s（工作日 %02d:%02d）",
+        plist_path, cfg.schedule_hour, cfg.schedule_minute,
+    )
+
+    if load:
+        subprocess.run(
+            ["launchctl", "unload", str(plist_path)],
+            capture_output=True, check=False,
+        )
+        subprocess.run(["launchctl", "load", str(plist_path)], check=True)
+        logger.info(
+            "launchctl 已加载盘中信号任务：工作日 %02d:%02d 推送",
+            cfg.schedule_hour, cfg.schedule_minute,
+        )
+    else:
+        logger.info("未加载。启用请运行: launchctl load %s（或重新执行 --load）", plist_path)
+    return plist_path

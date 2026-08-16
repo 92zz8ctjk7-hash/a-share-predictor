@@ -533,6 +533,33 @@ def cmd_incremental_update(args) -> None:
     print("模型已更新，可用 min-predict 基于最新模型实时预测")
 
 
+def cmd_serve_intraday(args) -> None:
+    """盘中实盘信号：拟合轨迹 + 强度信号 + 网格建议，推送（P3）。"""
+    from serving.intraday_signal import (
+        format_intraday_message,
+        predict_intraday_signal,
+        push_intraday_signal,
+    )
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    for code in codes:
+        sig = predict_intraday_signal(code)
+        if sig is None:
+            logger.warning("%s 无盘中信号（非交易日或数据不足），跳过", code)
+            continue
+        print(format_intraday_message(sig))
+        if not args.no_push:
+            push_intraday_signal(sig)
+
+
+def cmd_install_intraday_scheduler(args) -> None:
+    """安装盘中信号定时任务（交易日 10:01 推送）。"""
+    from serving.scheduler import install_intraday_scheduler
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    install_intraday_scheduler(codes, load=args.load)
+
+
 def cmd_plot_equity(args) -> None:
     """绘制回测资金曲线（需先运行过 backtest）。"""
     from backtest.plot import plot_equity
@@ -559,6 +586,12 @@ def cmd_rl_backtest(args) -> None:
             capital=args.capital if args.capital else cfg.bt_capital,
             model=args.model or "lstm",
             epochs=args.epochs if args.epochs is not None else 10,
+            include_market=not args.no_market,
+            include_dqn=args.with_dqn,
+            dqn_subset=args.dqn_subset if args.dqn_subset else 60,
+            dqn_epochs=args.dqn_epochs if args.dqn_epochs else 5,
+            include_hybrid=args.with_hybrid,
+            trend_th=args.trend_th if args.trend_th is not None else 0.03,
         )
         if report.empty:
             return
@@ -754,6 +787,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_inc.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"], help="分钟线频率（默认 5）")
     p_inc.set_defaults(func=cmd_incremental_update)
 
+    # serve-intraday（盘中实盘信号，P3）
+    p_si = sub.add_parser("serve-intraday", help="盘中实盘信号：拟合轨迹+强度信号+网格建议，推送")
+    p_si.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_si.add_argument("--no-push", action="store_true", help="仅打印不推送")
+    p_si.set_defaults(func=cmd_serve_intraday)
+
+    # install-intraday-scheduler（盘中信号定时任务）
+    p_iis = sub.add_parser("install-intraday-scheduler", help="安装盘中信号定时任务（交易日 10:01）")
+    p_iis.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_iis.add_argument("--load", action="store_true", help="安装后立即 launchctl load 启用")
+    p_iis.set_defaults(func=cmd_install_intraday_scheduler)
+
     # plot-equity（回测资金曲线绘图）
     p_plot = sub.add_parser("plot-equity", help="绘制回测资金曲线（需先运行过 backtest）")
     p_plot.add_argument("--code", type=str, required=True, help="股票代码，如 sz.000100")
@@ -772,6 +817,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_rl.add_argument("--walk", action="store_true",
                       help="全周期滚动 walk-forward（切多段覆盖牛熊震荡，资金跨段连续）")
     p_rl.add_argument("--segments", type=int, help="walk 模式测试段数（默认 4）")
+    p_rl.add_argument("--no-market", action="store_true",
+                      help="walk 模式禁用市场环境因子（指数环境+日历），用于对比实验")
+    p_rl.add_argument("--with-dqn", action="store_true",
+                      help="walk 模式启用 DQN（真 RL，差分奖赏）门控作为第五模式")
+    p_rl.add_argument("--dqn-subset", type=int, help="DQN 联合训练股票子集大小（默认 60）")
+    p_rl.add_argument("--dqn-epochs", type=int, help="DQN 训练轮数（默认 5）")
+    p_rl.add_argument("--with-hybrid", action="store_true",
+                      help="walk 模式启用混合门控（regime 切换：震荡用 DQN、趋势用 logistic，自动启用 DQN）")
+    p_rl.add_argument("--trend-th", type=float,
+                      help="混合门控趋势判定阈值 |idx_ret_20d|（默认 0.03）")
     p_rl.set_defaults(func=cmd_rl_backtest)
 
     # train

@@ -343,13 +343,15 @@ def build_roll_samples(
     code: str,
     frequency: str,
     base_preds: Optional[pd.DataFrame] = None,
+    with_market: bool = True,
 ) -> Optional[pd.DataFrame]:
     """构造滚动窗口分钟样本：当前 30 分钟窗口预测下一个 30 分钟涨跌。
 
     - 滚动步长 6 根 bar（30 分钟，不重叠），每天约 7 条样本
     - 标签 label_rest：下一窗口末 bar 收盘 / 当前窗口末 bar 收盘 - 1（%）
-    - 静态特征与 build_min_samples 一致（T-1 日线 + 压力位 + base_pred），
-      不注入宏观/基本面特征，保证与 build_predict_input 推理特征完全对齐
+    - 静态特征：T-1 日线 + 压力位 + base_pred，不注入宏观/基本面特征
+    - with_market=True 时注入市场环境特征（指数环境+日历，T 日收盘可得），
+      build_predict_input 推理时同样注入，保证训练/推理对齐
     - 午间休市：bar 序列天然连续，跨午休窗口（预测午后前 30 分钟）保留
 
     列结构与 build_min_samples 同构（MIN_SEQ_COLUMNS + 静态列 + label_rest 等），
@@ -428,7 +430,16 @@ def build_roll_samples(
 
     if not rows:
         return None
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    # 注入市场环境特征（指数环境+日历效应，与 build_predict_input 对齐）
+    if with_market:
+        from features.market import MARKET_FEATURES, load_market_features
+
+        market = load_market_features()
+        if market is not None:
+            out = out.merge(market.reset_index(), on="date", how="left")
+            out[MARKET_FEATURES] = out[MARKET_FEATURES].fillna(0.0)
+    return out
 
 
 def build_predict_input(
@@ -563,6 +574,14 @@ def build_predict_input(
     ]
     static = stat_row[static_cols].astype(np.float32)
     static["base_pred"] = np.float32(base_pred if base_pred is not None else 0.0)
+
+    # 市场环境特征（指数环境+日历，与 build_roll_samples 训练样本对齐）
+    from features.market import MARKET_FEATURES, load_market_features
+
+    market = load_market_features()
+    if market is not None and T in market.index:
+        for c in MARKET_FEATURES:
+            static[c] = float(market.loc[T, c])
 
     return {
         "date": T,

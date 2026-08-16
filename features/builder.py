@@ -231,13 +231,17 @@ def build_samples_to_store(
 
     # 外部数据自动检测（无数据时行为与之前完全一致）
     from features.external import load_graph_features, load_macro_features
+    from features.market import load_market_features
 
     macro_feats = load_macro_features()  # index=交易日，或 None
+    market_feats = load_market_features()  # 指数环境+日历，或 None
     graph_feats = load_graph_features()  # {code: 图特征 Series}，或 {}
-    if macro_feats is not None or graph_feats:
+    if macro_feats is not None or graph_feats or market_feats is not None:
         logger.info(
-            "检测到外部数据：macro=%s graph=%d 只，将注入基座样本",
-            "yes" if macro_feats is not None else "no", len(graph_feats),
+            "检测到外部数据：macro=%s market=%s graph=%d 只，将注入基座样本",
+            "yes" if macro_feats is not None else "no",
+            "yes" if market_feats is not None else "no",
+            len(graph_feats),
         )
 
     built: List[str] = []
@@ -261,6 +265,13 @@ def build_samples_to_store(
         if macro_feats is not None:
             n_before = len(sample.columns)
             sample = sample.merge(macro_feats.reset_index(), on="date", how="left")
+            new_cols = sample.columns[n_before:]
+            sample[new_cols] = sample[new_cols].fillna(0.0)
+
+        # 注入市场环境特征（指数环境+日历效应，按样本当日 join）
+        if market_feats is not None:
+            n_before = len(sample.columns)
+            sample = sample.merge(market_feats.reset_index(), on="date", how="left")
             new_cols = sample.columns[n_before:]
             sample[new_cols] = sample[new_cols].fillna(0.0)
 
