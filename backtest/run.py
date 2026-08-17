@@ -253,6 +253,336 @@ def _merge_with_base(
     return out.sort_values("date").reset_index(drop=True)
 
 
+def _merge_with_base_df(
+    signals_min: pd.DataFrame, bars_bt: pd.DataFrame, base_df: pd.DataFrame
+) -> pd.DataFrame:
+    """级联回退（指定 base_preds 表版）：缺失日用 sigmoid(base_pred) 补 next_open 信号。"""
+    min_dates = set(pd.to_datetime(signals_min["date"]))
+    missing = [d for d in bars_bt["date"] if d not in min_dates]
+    if not missing:
+        return signals_min
+    fb_src = base_df[pd.to_datetime(base_df["date"]).isin(missing)]
+    if fb_src.empty:
+        return signals_min
+    fb = pd.DataFrame(
+        {
+            "date": pd.to_datetime(fb_src["date"]),
+            "pred_reg": fb_src["base_pred"].to_numpy(dtype=np.float64),
+            "prob_up": _sigmoid(fb_src["base_pred"]),
+            "timing": "next_open",
+        }
+    )
+    out = pd.concat([signals_min, fb], ignore_index=True)
+    return out.sort_values("date").reset_index(drop=True)
+
+
+def _base_predict_with_net(bars: pd.DataFrame, net) -> pd.DataFrame:
+    """用给定基座网络对单股日线全量推理，返回 (date, code, base_pred)。
+
+    特征对齐训练时口径：FEATURE_COLUMNS（剔除全 NaN 列）+ 宏观 + 市场环境特征。
+    """
+    from features.builder import FEATURE_COLUMNS, compute_features
+    from features.external import load_macro_features
+    from features.market import MARKET_FEATURES, load_market_features
+    from models.train import nn_predict
+
+    df = compute_features(
+        bars.sort_values("date").reset_index(drop=True), window=cfg.window
+    )
+    feat_cols = [c for c in FEATURE_COLUMNS if c in df.columns and not df[c].isna().all()]
+    macro = load_macro_features()
+    if macro is not None:
+        df = df.merge(macro.reset_index(), on="date", how="left")
+        macro_cols = list(macro.columns)
+        df[macro_cols] = df[macro_cols].fillna(0.0)
+        feat_cols = feat_cols + macro_cols
+    market = load_market_features()
+    if market is not None:
+        df = df.merge(market.reset_index(), on="date", how="left")
+        df[MARKET_FEATURES] = df[MARKET_FEATURES].fillna(0.0)
+        feat_cols = feat_cols + list(MARKET_FEATURES)
+
+    feats = df[feat_cols].to_numpy(dtype=np.float32)
+    # 训练后的网络可能驻留 MPS/CUDA，推理前先移回 CPU（nn_predict 按 CPU 口径构造张量）
+    net = net.to("cpu")
+    pred_reg, _ = nn_predict(net, feats, mode="seq", seq_len=cfg.seq_len)
+    dates = df["date"].iloc[cfg.seq_len - 1:].reset_index(drop=True)
+    return pd.DataFrame(
+        {"date": dates.iloc[: len(pred_reg)], "base_pred": pred_reg}
+    )
+
+
+def _regime_label(buy_hold_pct: float) -> str:
+    if buy_hold_pct > 5:
+        return "上涨"
+    if buy_hold_pct < -5:
+        return "下跌"
+    return "震荡"
+
+
+def run_cascade_walk(
+    codes: List[str],
+    n_segments: int = 4,
+    frequency: str = "5",
+    capital: float = 100000.0,
+    grid_n: int = 10,
+    range_pct: float = 0.20,
+    gate_threshold: float = 0.5,
+    base_epochs: int = 10,
+    min_epochs: int = 30,
+    strict_base: bool = True,
+) -> pd.DataFrame:
+    """级联分钟模型多 regime walk-forward 回测。
+
+    分钟滚动样本切 n_segments 段（前 20% 作初始训练预热期），每段严格用
+    段前数据重训：strict_base=True 时连基座 LSTM 也用段前日线样本重训
+    （无前视）；分钟模型对段内推理，取每日首窗口（10:00）信号，
+    timing="close" 当日收盘撮合，缺失日回退基座 sigmoid 信号。
+    同时跑纯网格对照轨，资金跨段连续。输出报告 + 双轨曲线图。
+    """
+    import torch
+
+    from backtest.engine import CostConfig, run_engine
+    from backtest.strategy import GridStrategy
+    from data import store
+    from features.dataset import build_bundle
+    from features.min_builder import MIN_SEQ_COLUMNS, build_roll_samples
+    from features.min_dataset import build_min_bundle
+    from models.train import MinNNTrainer, train_model
+
+    cost = CostConfig()
+    meta_dir = DATA_DIR / "meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    sample_all = store.load_all_samples() if strict_base else None
+
+    rows: List[Dict] = []
+    for code in codes:
+        roll_all = store.load_all_roll_samples(frequency)
+        roll = roll_all[roll_all["code"] == code].sort_values("date")
+        bars = store.load_bars(code)
+        if roll.empty or bars is None or bars.empty:
+            logger.warning("%s 无滚动分钟样本或日线，跳过", code)
+            continue
+
+        dates = pd.Series(roll["date"].unique()).sort_values().reset_index(drop=True)
+        first_test = dates.quantile(0.20)  # 前 20% 作初始训练预热期
+        seg_dates = dates[dates >= first_test].reset_index(drop=True)
+        edges = [
+            seg_dates.iloc[0] + (seg_dates.iloc[-1] - seg_dates.iloc[0]) * i / n_segments
+            for i in range(n_segments + 1)
+        ]
+        logger.info(
+            "=== %s 级联 walk-forward：%d 段，测试期 %s ~ %s ===",
+            code, n_segments, edges[0].date(), edges[-1].date(),
+        )
+
+        carry_gate = capital
+        carry_none = capital
+        curves_gate: List[pd.DataFrame] = []
+        curves_none: List[pd.DataFrame] = []
+
+        for i in range(n_segments):
+            seg_start, seg_end = edges[i], edges[i + 1]
+            logger.info(
+                "--- S%d: %s ~ %s ---", i + 1, seg_start.date(), seg_end.date()
+            )
+
+            # 1. 段级 base_preds：严格模式段前重训基座，否则用全量（注明前视）
+            if strict_base:
+                sub = sample_all[sample_all["date"] < seg_start]
+                if len(sub) < 5000:
+                    logger.warning("S%d 基座训练样本不足（%d），跳过", i + 1, len(sub))
+                    continue
+                bundle_base = build_bundle(
+                    sub, train_ratio=cfg.train_ratio, valid_ratio=cfg.valid_ratio,
+                    seq_len=cfg.seq_len, mode="seq",
+                )
+                eff_base = Config(
+                    model="lstm", hidden_dim=cfg.hidden_dim,
+                    num_layers=cfg.num_layers, seq_len=cfg.seq_len,
+                    dropout=cfg.dropout, epochs=base_epochs,
+                    batch_size=cfg.batch_size, lr=cfg.lr, seed=cfg.seed,
+                    device=cfg.device,
+                    start_date=cfg.start_date, end_date=cfg.end_date,
+                    horizon=cfg.horizon, window=cfg.window,
+                )
+                _, trainer_base = train_model(bundle_base, eff_base)
+                base_code = _base_predict_with_net(bars, trainer_base.model)
+                base_code["code"] = code
+            else:
+                bp_all = pd.read_parquet(DATA_DIR / "meta" / "base_preds.parquet")
+                base_code = bp_all[bp_all["code"] == code][["date", "code", "base_pred"]]
+                base_code["date"] = pd.to_datetime(base_code["date"])
+
+            # 2. 用段级 base_preds 重建滚动分钟样本
+            roll_full = build_roll_samples(code, frequency, base_code)
+            if roll_full is None or roll_full.empty:
+                logger.warning("S%d 滚动样本构建失败，跳过", i + 1)
+                continue
+            train_roll = roll_full[roll_full["date"] < seg_start].reset_index(drop=True)
+            if len(train_roll) < 300:
+                logger.warning("S%d 分钟训练样本不足（%d），跳过", i + 1, len(train_roll))
+                continue
+
+            # 3. 段前训练分钟模型（尾部 15% 作验证）
+            bundle_min = build_min_bundle(train_roll, train_ratio=0.85, valid_ratio=0.15)
+            eff_min = Config(
+                model="intraday_lstm", hidden_dim=cfg.hidden_dim,
+                num_layers=cfg.num_layers, dropout=cfg.dropout,
+                epochs=min_epochs, batch_size=cfg.batch_size, lr=cfg.lr,
+                seed=cfg.seed, device=cfg.device,
+                start_date=cfg.start_date, end_date=cfg.end_date,
+                horizon=cfg.horizon, window=cfg.window, seq_len=cfg.seq_len,
+            )
+            trainer_min = MinNNTrainer(eff_min)
+            net = trainer_min.train(bundle_min)
+            net = net.to("cpu")  # 训练驻留 MPS，推理统一回 CPU
+
+            # 4. 段内推理：每日首窗口（10:00）作为当日信号
+            seg_rows = roll_full[
+                (roll_full["date"] >= seg_start) & (roll_full["date"] <= seg_end)
+            ].reset_index(drop=True)
+            if seg_rows.empty:
+                logger.warning("S%d 段内无分钟样本，跳过", i + 1)
+                continue
+            seq_t = torch.tensor(
+                seg_rows[MIN_SEQ_COLUMNS].to_numpy(np.float32).reshape(
+                    -1, 6, len(MIN_SEQ_COLUMNS) // 6
+                ),
+                dtype=torch.float32,
+            )
+            static_t = torch.tensor(
+                seg_rows[bundle_min.static_cols].to_numpy(np.float32),
+                dtype=torch.float32,
+            )
+            net.eval()
+            with torch.no_grad():
+                pred_reg, logits = net(seq_t, static_t)
+            seg_rows = seg_rows.assign(
+                pred_reg=pred_reg.squeeze(1).numpy(),
+                prob_up=torch.sigmoid(logits).squeeze(1).numpy(),
+            )
+            daily = seg_rows.groupby("date").head(1)
+            signals_min = pd.DataFrame(
+                {
+                    "date": daily["date"],
+                    "pred_reg": daily["pred_reg"],
+                    "prob_up": daily["prob_up"],
+                    "timing": "close",
+                }
+            )
+
+            # 5. 双轨回测（级联门控 vs 纯网格），资金跨段连续
+            bars_seg = bars[
+                (bars["date"] >= seg_start) & (bars["date"] <= seg_end)
+            ].reset_index(drop=True)
+            signals = _merge_with_base_df(signals_min, bars_seg, base_code)
+
+            res_gate = run_engine(
+                bars_seg, signals,
+                GridStrategy(grid_n=grid_n, range_pct=range_pct,
+                             gate_on=True, gate_threshold=gate_threshold),
+                capital=carry_gate, cost=cost,
+            )
+            res_none = run_engine(
+                bars_seg, None,
+                GridStrategy(grid_n=grid_n, range_pct=range_pct, gate_on=False),
+                capital=carry_none, cost=cost,
+            )
+            if "error" in res_gate.stats or "error" in res_none.stats:
+                logger.warning("S%d 回测失败，跳过", i + 1)
+                continue
+
+            regime = _regime_label(res_none.stats["buy_hold_return_pct"])
+            rng = f"{seg_start.date()}~{seg_end.date()}"
+            for mode, res in (("cascade", res_gate), ("none", res_none)):
+                rows.append(
+                    {
+                        "code": code, "segment": f"S{i + 1} {regime}",
+                        "mode": mode, "range": rng, "regime": regime,
+                        **res.stats,
+                    }
+                )
+            carry_gate = res_gate.stats["final_value"]
+            carry_none = res_none.stats["final_value"]
+            logger.info(
+                "S%d(%s): cascade %+.2f%% | 纯网格 %+.2f%% | 持有 %+.2f%%",
+                i + 1, regime,
+                res_gate.stats["total_return_pct"],
+                res_none.stats["total_return_pct"],
+                res_none.stats["buy_hold_return_pct"],
+            )
+            if res_gate.equity_curve is not None:
+                curves_gate.append(res_gate.equity_curve)
+            if res_none.equity_curve is not None:
+                curves_none.append(res_none.equity_curve)
+
+        # 全周期汇总行
+        for mode, carry in (("cascade", carry_gate), ("none", carry_none)):
+            seg_rows_rep = [
+                r for r in rows if r["code"] == code and r["mode"] == mode
+            ]
+            if seg_rows_rep:
+                rows.append(
+                    {
+                        "code": code, "segment": "ALL", "mode": mode,
+                        "range": f"{edges[0].date()}~{edges[-1].date()}",
+                        "regime": "混合",
+                        "final_value": carry,
+                        "total_return_pct": round((carry / capital - 1) * 100, 2),
+                    }
+                )
+
+        # 双轨曲线图（资金跨段拼接）
+        if curves_gate and curves_none:
+            try:
+                _plot_cascade_walk(
+                    code, pd.concat(curves_gate), pd.concat(curves_none),
+                    meta_dir / f"equity_cascade_walk_{code}.png",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("级联 walk 绘图失败：%s", exc)
+
+    report = pd.DataFrame(rows)
+    if report.empty:
+        logger.warning("级联 walk-forward 无结果")
+        return report
+    out = meta_dir / "cascade_walk_report.csv"
+    report.to_csv(out, index=False)
+    logger.info("级联 walk-forward 报告已保存到 %s（%d 行）", out, len(report))
+    return report
+
+
+def _plot_cascade_walk(
+    code: str, curve_gate: pd.DataFrame, curve_none: pd.DataFrame, path
+) -> None:
+    """绘制级联 walk-forward 双轨资金曲线。"""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["font.family"] = ["Arial Unicode MS"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    ax.plot(pd.to_datetime(curve_gate["date"]), curve_gate["total"],
+            color="#d62728", lw=1.6, label="级联分钟门控")
+    ax.plot(pd.to_datetime(curve_none["date"]), curve_none["total"],
+            color="#2ca02c", lw=1.2, ls="--", label="纯网格")
+    if "close" in curve_none.columns:
+        bh = curve_none["total"].iloc[0] * curve_none["close"] / curve_none["close"].iloc[0]
+        ax.plot(pd.to_datetime(curve_none["date"]), bh,
+                color="#7f7f7f", lw=1.0, ls=":", label="买入持有")
+    ax.set_title(f"{code} 级联分钟模型 walk-forward（每段严格样本外）")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    logger.info("级联 walk 曲线图已保存到 %s", path)
+
+
 def _predict_with_pretrained(bars: pd.DataFrame, model_name: str = "lstm") -> pd.DataFrame:
     """加载已训练的基座 checkpoint 全量推理，返回 (date, pred_reg, prob_up, timing)。
 

@@ -450,6 +450,34 @@ def cmd_backtest(args) -> None:
         [w.strip() for w in args.windows.split(",") if w.strip()]
         if args.windows else cfg.bt_windows
     )
+
+    # 级联 walk-forward：多 regime 分段严格样本外评估
+    if (args.signal_source or "base") == "cascade" and getattr(args, "walk", False):
+        from backtest.run import run_cascade_walk
+
+        report = run_cascade_walk(
+            codes=codes,
+            n_segments=args.segments if args.segments else 4,
+            frequency=args.min_frequency or "5",
+            capital=args.capital if args.capital else cfg.bt_capital,
+            grid_n=args.grid_n if args.grid_n is not None else cfg.bt_grid_n,
+            range_pct=args.range_pct if args.range_pct is not None else cfg.bt_range_pct,
+            gate_threshold=args.gate_threshold
+            if args.gate_threshold is not None else cfg.bt_gate_threshold,
+            strict_base=not args.no_strict_base,
+        )
+        if report.empty:
+            return
+        seg_cols = ["code", "segment", "mode", "range", "total_return_pct",
+                    "max_drawdown_pct", "sharpe", "win_rate", "n_trades",
+                    "buy_hold_return_pct"]
+        agg_cols = ["code", "segment", "mode", "final_value", "total_return_pct"]
+        print("\n===== 级联 walk-forward 分段对比 =====")
+        print(report[report.segment != "ALL"][[c for c in seg_cols if c in report.columns]].to_string(index=False))
+        print("\n===== 全周期汇总（资金跨段连续）=====")
+        print(report[report.segment == "ALL"][[c for c in agg_cols if c in report.columns]].to_string(index=False))
+        return
+
     report = run_backtest(
         codes=codes,
         capital=args.capital if args.capital else cfg.bt_capital,
@@ -765,6 +793,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--no-curves", action="store_true", help="不保存每日资金曲线 CSV")
     p_bt.add_argument("--pretrained", action="store_true",
                       help="直接加载已有 checkpoint（cache/models/{model}.pt）回测，不重新训练")
+    p_bt.add_argument("--walk", action="store_true",
+                      help="cascade 模式启用多 regime walk-forward（分段严格样本外，资金跨段连续）")
+    p_bt.add_argument("--segments", type=int, help="walk 模式测试段数（默认 4）")
+    p_bt.add_argument("--no-strict-base", action="store_true",
+                      help="walk 模式不逐段重训基座（用全量 base_preds，有轻微前视）")
     p_bt.set_defaults(func=cmd_backtest)
 
     # factor-ic（因子有效性分析）
