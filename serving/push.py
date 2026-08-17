@@ -38,17 +38,20 @@ def _webhook() -> str:
 
 
 def format_signal_message(signal: dict) -> str:
-    """将信号 dict 格式化为企业微信 markdown 消息。"""
+    """将信号 dict 格式化为通俗易懂的 markdown 推送消息。"""
     bullish = "偏多" in signal.get("action", "")
     color = "info" if bullish else "warning"
+    chg = signal["predicted_change_pct"]
+    direction = "涨" if chg >= 0 else "跌"
+    prob_pct = round(signal["prob_close_up"] * 100)
+    advice = "可以买入" if bullish else "只卖不买，先别加仓"
     return (
-        f"**盘中信号 {signal['code']}**\n"
-        f"> 交易日: {signal['date']}\n"
-        f"> 10:00价: {signal['price_at_1000']}\n"
-        f"> 未来30分钟: {signal['predicted_close']}"
-        f"（{signal['predicted_change_pct']:+.2f}%）\n"
-        f"> 未来30分钟上涨概率: {signal['prob_close_up']:.2f}\n"
-        f"> 信号: <font color=\"{color}\">{signal['action']}</font>"
+        f"**{signal['code']} 盘中信号**\n"
+        f"> 今天 {signal['date']}，10:00 最新价 {signal['price_at_1000']} 元\n"
+        f"> 模型判断：未来 30 分钟大概率{direction}，"
+        f"到 {signal['predicted_close']} 元左右（{chg:+.2f}%）\n"
+        f"> 上涨把握：{prob_pct}%\n"
+        f"> 建议：<font color=\"{color}\">{advice}</font>"
     )
 
 

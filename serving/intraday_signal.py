@@ -193,25 +193,35 @@ def _fit_trajectory(
 
 
 def format_intraday_message(sig: Dict) -> str:
-    """将盘中信号格式化为推送消息（拟合轨迹 + 强度信号 + 网格建议）。"""
+    """将盘中信号格式化为通俗易懂的推送消息（轨迹 + 波动 + 网格建议）。"""
     traj = sig.get("trajectory", {})
     exp_rest = traj.get("expected_rest_pct", 0.0)
     band = traj.get("band_pct", 0.0)
-    method = traj.get("method", "")
     exp_close = sig["current_price"] * (1 + exp_rest / 100)
+
+    # 开盘以来的涨跌
+    open_chg = (sig["current_price"] / sig["open_price"] - 1) * 100 if sig["open_price"] else 0.0
+    trend = "上涨" if exp_rest >= 0 else "下跌"
 
     # 动作颜色
     act = sig["grid_action"]
     color = "info" if "买" in act else ("warning" if "卖" in act else "comment")
 
+    # 网格位置口语化：pos = 当前价下方的格数（共 10 格），格数越多价越低
+    grid_n = cfg.bt_grid_n
+    pos = sig["grid_pos"]
+    pos_desc = f"价格处于 {grid_n} 格网格的第 {round(pos)} 格（越低越适合买）"
+
     lines = [
-        f"**盘中信号 {sig['code']}** ({sig['date']} {sig['time']})",
-        f"> 现价: {sig['current_price']}  开盘: {sig['open_price']}",
-        f"> 基座方向: {sig['base_direction']} ({sig['base_pred_pct']:+.2f}%)",
-        f"> 拟合轨迹: 剩余预期 {exp_rest:+.2f}% (±{band:.2f}%) → 预期收盘 {exp_close:.2f}",
-        f"> 强度信号: {sig['vol_level']} (波动分位 {sig['vol_pctile']:.0%})",
-        f"> 网格建议: <font color=\"{color}\">{act}</font>",
-        f"> {sig['grid_reason']} (网格位置 {sig['grid_pos']})",
+        f"**{sig['code']} 盘中参考**（{sig['date']} {sig['time']}）",
+        f"> 现价: {sig['current_price']} 元（开盘 {sig['open_price']} 元，已{open_chg:+.2f}%）",
+        f"> 大盘模型看后市: {'看涨' if sig['base_direction'] == '偏多' else '看跌'}"
+        f"（预期 {sig['base_pred_pct']:+.2f}%）",
+        f"> 今天剩余时间: 预计{trend} {abs(exp_rest):.2f}%，"
+        f"收盘大约 {exp_close:.2f} 元（上下浮动 {band:.2f}%）",
+        f"> 盘面波动: {sig['vol_level']}（近期波动排在 {sig['vol_pctile']:.0%} 位置）",
+        f"> 网格操作建议: <font color=\"{color}\">{act}</font>",
+        f"> {sig['grid_reason']}；{pos_desc}",
     ]
     return "\n".join(lines)
 
