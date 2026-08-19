@@ -22,6 +22,11 @@ class Config:
     fetch_sleep: float = 0.3                # 批量拉取时每只股票之间的间隔秒数
     include_delisted: bool = True           # 全量拉取时是否包含退市股（避免幸存者偏差）
     min_frequency: str = "5"                # 分钟线频率：5/15/30/60
+    # 分钟模型辅助训练股（面板板块，与 sz.000100 走势联动）：
+    # 仅参与联合训练，不做 serving
+    min_aux_codes: list = field(
+        default_factory=lambda: ["sz.000725", "sh.600707"]
+    )
 
     # ---- 标签 / 预测 ----
     horizon: int = 5                        # 预测未来 N 个交易日

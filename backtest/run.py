@@ -89,6 +89,21 @@ def _train_and_predict(
     inner_end = int(len(train_part) * 0.85)
     tr, va = train_part.iloc[:inner_end], train_part.iloc[inner_end:]
 
+    # 特征标准化（z-score，仅用训练段统计量）：与 build_bundle 口径一致，
+    # 防止大量级慢变特征（宏观/价格均线）主导梯度导致模型退化
+    mu = train_part[feature_names].mean().to_numpy(dtype=np.float64)
+    sd = train_part[feature_names].std().to_numpy(dtype=np.float64)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+
+    def _std_df(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out[feature_names] = (
+            out[feature_names].to_numpy(dtype=np.float64) - mu
+        ) / sd
+        return out
+
+    tr, va, test_part = _std_df(tr), _std_df(va), _std_df(test_part)
+
     mode = "seq" if model_name == "lstm" else "flat"
     seq_len = cfg.seq_len
 
@@ -301,6 +316,11 @@ def _base_predict_with_net(bars: pd.DataFrame, net) -> pd.DataFrame:
         df = df.merge(market.reset_index(), on="date", how="left")
         df[MARKET_FEATURES] = df[MARKET_FEATURES].fillna(0.0)
         feat_cols = feat_cols + list(MARKET_FEATURES)
+
+    # 应用训练时持久化的标准化（与 build_bundle 口径对齐）
+    from features.dataset import apply_feature_scaler
+
+    apply_feature_scaler(df, feat_cols)
 
     feats = df[feat_cols].to_numpy(dtype=np.float32)
     # 训练后的网络可能驻留 MPS/CUDA，推理前先移回 CPU（nn_predict 按 CPU 口径构造张量）
@@ -593,6 +613,7 @@ def _predict_with_pretrained(bars: pd.DataFrame, model_name: str = "lstm") -> pd
 
     from features.builder import FEATURE_COLUMNS, compute_features
     from features.external import load_macro_features
+    from features.market import MARKET_FEATURES, load_market_features
     from models.nn import LSTM
     from models.train import nn_predict
 
@@ -610,6 +631,16 @@ def _predict_with_pretrained(bars: pd.DataFrame, model_name: str = "lstm") -> pd
         macro_cols = list(macro.columns)
         df[macro_cols] = df[macro_cols].fillna(0.0)
         feat_cols = feat_cols + macro_cols
+    market = load_market_features()
+    if market is not None:
+        df = df.merge(market.reset_index(), on="date", how="left")
+        df[MARKET_FEATURES] = df[MARKET_FEATURES].fillna(0.0)
+        feat_cols = feat_cols + list(MARKET_FEATURES)
+
+    # 应用训练时持久化的标准化（与 build_bundle 口径对齐）
+    from features.dataset import apply_feature_scaler
+
+    apply_feature_scaler(df, feat_cols)
 
     ckpt = torch.load(model_path, map_location="cpu")
     state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt

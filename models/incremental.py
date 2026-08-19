@@ -90,6 +90,7 @@ def _train_base_window(sample, window_spec, model_name, epochs, resume) -> Tuple
     bundle = build_bundle(
         sub, train_ratio=cfg.train_ratio, valid_ratio=cfg.valid_ratio,
         seq_len=cfg.seq_len, mode=mode,
+        persist_scaler=True,  # 持久化标准化参数，供独立推理路径对齐
     )
     eff_cfg = _eff_cfg(model_name, epochs)
     init_state = _maybe_load_state(resume, DATA_DIR / "models" / f"{model_name}.pt")
@@ -130,6 +131,36 @@ def _train_min_window(min_sample, window_spec, frequency, epochs, resume) -> int
     return len(sub)
 
 
+def _aux_base_preds(codes: List[str], model_name: str = "lstm") -> Optional[pd.DataFrame]:
+    """用已保存的基座模型对辅助训练股推理，返回 (date, code, base_pred)。
+
+    辅助股不在基座样本池（沪深300），predict_base_all 覆盖不到，
+    这里逐股用 checkpoint 全量推理（特征口径与训练一致）。
+    """
+    if not codes:
+        return None
+    from backtest.run import _predict_with_pretrained
+    from data import store
+
+    frames = []
+    for c in codes:
+        bars = store.load_bars(c)
+        if bars is None or bars.empty:
+            logger.warning("辅助股 %s 无日线数据，跳过基座推理", c)
+            continue
+        try:
+            sig = _predict_with_pretrained(bars, model_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("辅助股 %s 基座推理失败: %s", c, exc)
+            continue
+        frames.append(pd.DataFrame(
+            {"date": sig["date"], "code": c, "base_pred": sig["pred_reg"]}
+        ))
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
 def run_incremental_update(
     codes: List[str],
     base_window: str = "2y",
@@ -140,7 +171,11 @@ def run_incremental_update(
     resume: bool = False,
     frequency: str = "5",
 ) -> Dict:
-    """一键增量更新全流程，返回各阶段摘要。"""
+    """一键增量更新全流程，返回各阶段摘要。
+
+    辅助训练股（cfg.min_aux_codes，面板板块）：刷新日线+分钟线、生成基座预测、
+    构建滚动样本参与分钟模型联合训练，但不参与 serving。
+    """
     from data import store
     from data.fetcher import BaoStockClient, fetch_minutes, fetch_stock
     from features.builder import build_samples_to_store
@@ -149,18 +184,22 @@ def run_incremental_update(
 
     today = date.today().isoformat()
     base_codes = _load_base_codes()
+    aux_codes = [c for c in cfg.min_aux_codes if c not in codes]
     summary: Dict = {}
 
     # 1. 数据刷新（串行 baostock，避免会话互踢）
-    logger.info("[1/6] 刷新数据：基座 %d 只日线 + %d 只分钟线", len(base_codes), len(codes))
+    logger.info(
+        "[1/6] 刷新数据：基座 %d 只日线 + %d 只分钟线（含辅助股 %d 只）",
+        len(base_codes), len(codes) + len(aux_codes), len(aux_codes),
+    )
     with BaoStockClient() as client:
-        for c in base_codes:
+        for c in base_codes + aux_codes:
             try:
                 fetch_stock(c, cfg.start_date, today, frequency="d", adjust=cfg.adjust,
                             use_cache=True, refresh=True, client=client)
             except Exception as exc:  # noqa: BLE001
                 logger.error("刷新日线 %s 失败: %s", c, exc)
-        for c in codes:
+        for c in codes + aux_codes:
             try:
                 fetch_minutes(c, cfg.start_date, today, frequency=frequency,
                               refresh=True, client=client)
@@ -183,13 +222,21 @@ def run_incremental_update(
     model_path = DATA_DIR / "models" / f"{base_model}.pt"
     eff_cfg = _eff_cfg(base_model, base_epochs)
     base_preds = predict_base_all(bundle, eff_cfg, str(model_path))
+    # 辅助训练股不在基座样本池，用已保存模型单独推理后合并
+    aux_preds = _aux_base_preds(aux_codes, base_model)
+    if aux_preds is not None and not aux_preds.empty:
+        base_preds = pd.concat(
+            [base_preds[~base_preds["code"].isin(aux_codes)], aux_preds],
+            ignore_index=True,
+        )
+        logger.info("辅助股基座预测已合并：%d 条", len(aux_preds))
     bp_path = DATA_DIR / "meta" / "base_preds.parquet"
     bp_path.parent.mkdir(parents=True, exist_ok=True)
     base_preds.to_parquet(bp_path, index=False)
 
-    # 5. 滚动分钟样本重建（当前 30 分钟 → 预测下一个 30 分钟）
+    # 5. 滚动分钟样本重建（当前 30 分钟 → 预测下一个 30 分钟；含辅助股）
     logger.info("[5/6] 重建滚动分钟样本")
-    for code in codes:
+    for code in codes + aux_codes:
         roll = build_roll_samples(code, frequency, base_preds)
         if roll is not None and not roll.empty:
             store.save_roll_samples(roll, code, frequency)
@@ -202,6 +249,20 @@ def run_incremental_update(
     min_sample = store.load_all_roll_samples(frequency)
     n_min = _train_min_window(min_sample, min_window, frequency, min_epochs, resume)
     summary["min_window_samples"] = n_min
+
+    # 7. logistic 门控重训（生产策略的买入门控，秒级）
+    try:
+        from rl_gate.gate import train_gate
+        from rl_gate.opportunity import build_opportunities, get_features
+
+        logger.info("[+] 重训 logistic 门控")
+        base_codes = _load_base_codes()
+        feats_list = get_features(True)
+        opp = build_opportunities(base_codes, with_market=True)
+        gate_bundle = train_gate(opp, feats_list)
+        summary["gate_auc"] = round(gate_bundle["auc"], 4)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("logistic 门控重训失败（不影响主流程）: %s", exc)
 
     logger.info("增量更新完成：%s", summary)
     return summary

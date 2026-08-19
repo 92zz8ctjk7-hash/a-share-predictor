@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # 训练段占窗口比例（其余为测试段）
 TRAIN_RATIO = 0.75
 
-MODES = ["none", "fixed", "rolling", "gate"]
+MODES = ["none", "fixed", "rolling", "gate", "adaptive", "patient", "pgate", "agg"]
 
 # 方案 A 的阈值搜索网格
 THETA_GRID = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -79,10 +79,14 @@ def _plot_comparison(code: str, window: str, curves: Dict[str, pd.DataFrame]) ->
     plt.rcParams["font.family"] = ["Arial Unicode MS"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    colors = {"none": "#7f7f7f", "fixed": "#ff7f0e", "rolling": "#2ca02c",
-              "gate": "#d62728", "dqn": "#9467bd", "hybrid": "#17becf"}
+    colors = {"none": "#7f7f7f", "fixed": "#ff7f0e",
+              "rolling": "#2ca02c", "gate": "#d62728", "dqn": "#9467bd", "hybrid": "#17becf",
+              "adaptive": "#e377c2", "patient": "#8c564b", "pgate": "#1f77b4",
+              "agg": "#bcbd22"}
     labels = {"none": "纯网格", "fixed": "固定阈值0.5", "rolling": "滚动最优θ",
-              "gate": "Bandit门控", "dqn": "DQN门控(RL)", "hybrid": "混合门控(regime切换)"}
+              "gate": "Bandit门控", "dqn": "DQN门控(RL)", "hybrid": "混合门控(regime切换)",
+              "adaptive": "自适应分位数门控", "patient": "耐心低吸",
+              "pgate": "耐心低吸+门控", "agg": "深跌加倍"}
 
     fig, ax = plt.subplots(figsize=(13, 7))
     ref = None
@@ -283,13 +287,23 @@ def _train_and_predict_segment(
 
     net, meta = load_nn_checkpoint(str(ckpt_dir / "best.pt"))
     cols = meta["feature_names"]
+
+    # 推理特征需应用训练时同口径的标准化（bundle 内部已标准化，
+    # 此处手工拼的推理矩阵必须用 train_part 统计量对齐，防量级失衡）
+    mu = train_part[cols].mean().to_numpy(dtype=np.float64)
+    sd = train_part[cols].std().to_numpy(dtype=np.float64)
+    sd = np.where(sd < 1e-8, 1.0, sd)
+
+    def _std(d: pd.DataFrame) -> np.ndarray:
+        return ((d[cols].to_numpy(dtype=np.float64) - mu) / sd).astype(np.float32)
+
     if mode == "seq":
         context = train_part[cols].tail(seq_len - 1)
         seq_src = pd.concat([context, test_part[cols]], ignore_index=True)
-        X = seq_src.to_numpy(dtype=np.float32)
+        X = _std(seq_src)
         pred_reg, prob_up = nn_predict(net, X, mode="seq", seq_len=seq_len)
     else:
-        X = test_part[cols].to_numpy(dtype=np.float32)
+        X = _std(test_part)
         pred_reg, prob_up = nn_predict(net, X, mode="flat")
     return pd.DataFrame(
         {"date": test_part["date"].to_numpy(), "pred_reg": pred_reg,
@@ -363,9 +377,12 @@ def _plot_walk_comparison(
     plt.rcParams["font.family"] = ["Arial Unicode MS"]
     plt.rcParams["axes.unicode_minus"] = False
     colors = {"none": "#7f7f7f", "fixed": "#ff7f0e",
-              "rolling": "#2ca02c", "gate": "#d62728"}
+              "rolling": "#2ca02c", "gate": "#d62728", "adaptive": "#e377c2",
+              "patient": "#8c564b", "pgate": "#1f77b4", "agg": "#bcbd22"}
     labels = {"none": "纯网格", "fixed": "固定阈值0.5",
-              "rolling": "滚动最优θ", "gate": "Bandit门控"}
+              "rolling": "滚动最优θ", "gate": "Bandit门控",
+              "adaptive": "自适应分位数门控", "patient": "耐心低吸",
+              "pgate": "耐心低吸+门控", "agg": "深跌加倍"}
 
     n = len(seg_curves)
     fig, axes = plt.subplots(n, 1, figsize=(13, 4.2 * n), sharex=False)
@@ -412,6 +429,8 @@ def run_rl_walk(
     dqn_epochs: int = 5,
     include_hybrid: bool = False,
     trend_th: float = 0.03,
+    dynamic_lot: bool = False,
+    use_capital_plan: bool = False,
 ) -> pd.DataFrame:
     """全周期滚动 walk-forward：切 n_segments 段测试期（覆盖牛熊震荡）。
 
@@ -484,6 +503,21 @@ def run_rl_walk(
         agg = {m: {"init": capital, "final": capital} for m in modes_all}
         seg_curves, seg_info = [], []
 
+        # 自适应门控控制器：状态跨段连续，逐段注入新训练的段信号
+        from rl_gate.adaptive_gate import AdaptiveGateController
+
+        adaptive_ctrl = AdaptiveGateController()
+        adaptive_ctrl.bind(bars["date"], bars["open"], bars["close"])
+
+        # 回撤预算资金计划：每模式独立实例（状态跨段连续，不可跨模式共享）
+        cap_plans: Dict = {}
+        if use_capital_plan:
+            from backtest.capital_plan import BudgetedCapitalPlan
+
+            cap_plans = {
+                m: BudgetedCapitalPlan(init_capital=capital) for m in modes_all
+            }
+
         for i in range(n_segments):
             seg_start, seg_end = edges[i], edges[i + 1]
             bars_seg = bars[
@@ -537,7 +571,9 @@ def run_rl_walk(
                                          gate_on=True, gate_threshold=best_theta), signals),
             ]:
                 res = run_engine(bars_seg, sig, strat,
-                                 capital=cur_capital[mode], cost=cost)
+                                 capital=cur_capital[mode], cost=cost,
+                                 dynamic_lot=dynamic_lot,
+                                 capital_plan=cap_plans.get(mode))
                 cur_capital[mode] = res.stats["final_value"]
                 agg[mode]["final"] = cur_capital[mode]
                 curves[mode] = res.equity_curve
@@ -559,12 +595,101 @@ def run_rl_walk(
                 GridStrategy(grid_n=grid_n, range_pct=range_pct,
                              gate_on=False, buy_gate=buy_gate),
                 capital=cur_capital["gate"], cost=cost,
+                dynamic_lot=dynamic_lot,
+                capital_plan=cap_plans.get("gate"),
             )
             cur_capital["gate"] = res.stats["final_value"]
             agg["gate"]["final"] = cur_capital["gate"]
             curves["gate"] = res.equity_curve
             rows.append({
                 "code": code, "segment": f"S{i + 1} {regime}", "mode": "gate",
+                "range": f"{seg_start.date()}~{seg_end.date()}",
+                "regime": regime, "gate_auc": round(gate_bundle["auc"], 4),
+                "best_theta": best_theta, **res.stats,
+            })
+
+            # adaptive 模式（分位数阈值 + 自适应探索，复用段信号，无额外训练）
+            adaptive_ctrl.add_probs(
+                dict(zip(pd.to_datetime(signals["date"]), signals["prob_up"]))
+            )
+            res = run_engine(
+                bars_seg, None,
+                GridStrategy(grid_n=grid_n, range_pct=range_pct,
+                             gate_on=False, buy_gate=adaptive_ctrl.gate),
+                capital=cur_capital["adaptive"], cost=cost,
+                dynamic_lot=dynamic_lot,
+                capital_plan=cap_plans.get("adaptive"),
+            )
+            cur_capital["adaptive"] = res.stats["final_value"]
+            agg["adaptive"]["final"] = cur_capital["adaptive"]
+            curves["adaptive"] = res.equity_curve
+            rows.append({
+                "code": code, "segment": f"S{i + 1} {regime}", "mode": "adaptive",
+                "range": f"{seg_start.date()}~{seg_end.date()}",
+                "regime": regime, "gate_auc": round(gate_bundle["auc"], 4),
+                "best_theta": best_theta, **res.stats,
+            })
+            logger.info(
+                "S%d 自适应门控状态: %s", i + 1, adaptive_ctrl.summary()
+            )
+
+            # patient 模式（耐心低吸：看跌时买得更深更慢，复用段信号）
+            from backtest.strategy import PatientGridStrategy
+
+            res = run_engine(
+                bars_seg, signals,
+                PatientGridStrategy(depth_shift=2, max_add_per_day=1,
+                                    grid_n=grid_n, range_pct=range_pct),
+                capital=cur_capital["patient"], cost=cost,
+                dynamic_lot=dynamic_lot,
+                capital_plan=cap_plans.get("patient"),
+            )
+            cur_capital["patient"] = res.stats["final_value"]
+            agg["patient"]["final"] = cur_capital["patient"]
+            curves["patient"] = res.equity_curve
+            rows.append({
+                "code": code, "segment": f"S{i + 1} {regime}", "mode": "patient",
+                "range": f"{seg_start.date()}~{seg_end.date()}",
+                "regime": regime, "gate_auc": round(gate_bundle["auc"], 4),
+                "best_theta": best_theta, **res.stats,
+            })
+
+            # pgate 模式（耐心低吸 + logistic 门控叠加）
+            res = run_engine(
+                bars_seg, signals,
+                PatientGridStrategy(depth_shift=2, max_add_per_day=1,
+                                    grid_n=grid_n, range_pct=range_pct,
+                                    buy_gate=buy_gate),
+                capital=cur_capital["pgate"], cost=cost,
+                dynamic_lot=dynamic_lot,
+                capital_plan=cap_plans.get("pgate"),
+            )
+            cur_capital["pgate"] = res.stats["final_value"]
+            agg["pgate"]["final"] = cur_capital["pgate"]
+            curves["pgate"] = res.equity_curve
+            rows.append({
+                "code": code, "segment": f"S{i + 1} {regime}", "mode": "pgate",
+                "range": f"{seg_start.date()}~{seg_end.date()}",
+                "regime": regime, "gate_auc": round(gate_bundle["auc"], 4),
+                "best_theta": best_theta, **res.stats,
+            })
+
+            # agg 模式（深跌加倍：浅跌攒弹药、深跌加倍买，进攻型）
+            from backtest.strategy import AggressiveDipStrategy
+
+            res = run_engine(
+                bars_seg, signals,
+                AggressiveDipStrategy(skip_grids=2, double_mult=2,
+                                      grid_n=grid_n, range_pct=range_pct),
+                capital=cur_capital["agg"], cost=cost,
+                dynamic_lot=dynamic_lot,
+                capital_plan=cap_plans.get("agg"),
+            )
+            cur_capital["agg"] = res.stats["final_value"]
+            agg["agg"]["final"] = cur_capital["agg"]
+            curves["agg"] = res.equity_curve
+            rows.append({
+                "code": code, "segment": f"S{i + 1} {regime}", "mode": "agg",
                 "range": f"{seg_start.date()}~{seg_end.date()}",
                 "regime": regime, "gate_auc": round(gate_bundle["auc"], 4),
                 "best_theta": best_theta, **res.stats,

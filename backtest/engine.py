@@ -206,6 +206,8 @@ def run_engine(
     capital: float = 100000.0,
     cost: Optional[CostConfig] = None,
     shares_per_lot: Optional[int] = None,
+    dynamic_lot: bool = False,
+    capital_plan=None,
 ) -> BacktestResult:
     """逐日撮合回测。
 
@@ -219,6 +221,10 @@ def run_engine(
         capital       : 初始资金
         cost          : 成本模型
         shares_per_lot: 每格固定股数；None 时按 capital/grid_n 首次买入价折算整手
+        dynamic_lot   : True 时每格股数按「当前总资产/grid_n/现价」动态重算
+                        （每格权重恒定，复利效应；False 为静态首笔折算，现有行为）
+        capital_plan  : 分层资金计划（TieredCapitalPlan，优先级高于 dynamic_lot）：
+                        盈利区复利折算 + 相对/绝对双回撤刹车 + 危险态冻结买入
 
     流程：第 i 日开盘执行 i-1 日的 next_open 信号，收盘执行 i 日的 close 信号，
     收盘后记录资金曲线；T+1 规则不变（当日买入批次当日不可卖）。
@@ -256,15 +262,31 @@ def run_engine(
             per_lot_cash = capital / max(strategy.grid_n, 1)
             lot_shares = max(int(per_lot_cash / price / LOT_SHARES), 1) * LOT_SHARES
 
+        # 动态每格股数：按当前总资产重算，保持每格权重恒定（复利效应）
+        eff_lot = lot_shares
+        if capital_plan is not None:
+            equity = account.cash + account.market_value(price)
+            capital_plan.update(equity)
+            # 状态约束：防御态降最大格数，危险态冻结新买入
+            target = min(target, capital_plan.max_grids(strategy.grid_n, equity, price))
+            if not capital_plan.allow_buy():
+                target = min(target, cur_lots)
+            eff_lot = capital_plan.lot_size(equity, price, strategy.grid_n)
+        elif dynamic_lot and shares_per_lot is None:
+            equity = account.cash + account.market_value(price)
+            eff_lot = max(
+                int(equity / max(strategy.grid_n, 1) / price / LOT_SHARES), 1
+            ) * LOT_SHARES
+
         if target > cur_lots:
             # 逐格买入（现金不足时停止）
             for _ in range(target - cur_lots):
-                if not account.buy(lot_shares, price, day):
+                if not account.buy(eff_lot, price, day):
                     break
         elif target < cur_lots:
             # 逐格卖出（T+1 限制下卖不掉的保留）
             for _ in range(cur_lots - target):
-                if account.sell(lot_shares, price, day) == 0:
+                if account.sell(eff_lot, price, day) == 0:
                     break
 
     for i in range(len(bars)):

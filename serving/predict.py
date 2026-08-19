@@ -58,6 +58,15 @@ def predict_intraday(
                           frequency=frequency, refresh=True)
             realtime_min = None
         else:
+            # 防过期推送：实时源最新交易日不是今天（数据源同步延迟，
+            # 如开盘初期当日 bar 未到位）时跳过，避免推送昨日信号
+            latest = pd.Timestamp(realtime_min["date"].max()).date()
+            if latest != date.today():
+                logger.warning(
+                    "%s 实时分钟源最新交易日为 %s（非今天），跳过本次预测避免推送过期信号",
+                    code, latest,
+                )
+                return None
             logger.info("已获取 akshare 实时分钟线 %d 根", len(realtime_min))
     else:
         fetch_minutes(code, start_date=cfg.start_date, end_date=end,

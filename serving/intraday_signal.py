@@ -20,6 +20,9 @@ from config import DATA_DIR, cfg
 
 logger = logging.getLogger(__name__)
 
+# 板块同伴（面板板块，仅展示与反转提示，不参与 serving 预测）
+PEER_NAMES = {"sz.000725": "京东方A", "sh.600707": "彩虹股份"}
+
 # 强度档位（已实现波动率分位）
 VOL_LOW_TH = 0.33   # 低于 33 分位 = 低波
 VOL_HIGH_TH = 0.67  # 高于 67 分位 = 高波
@@ -66,6 +69,50 @@ def _grid_suggestion(price: float, base_price: float, range_pct: float, grid_n: 
         else:
             action, reason = "观望", "价格处于网格中位，持仓观望"
     return {"action": action, "reason": reason, "grid_pos": round(float(pos), 2)}
+
+
+def _peer_context() -> Dict:
+    """板块同伴动态：今日早盘走势（实时）+ 昨日涨跌反转提示。
+
+    实证依据（5 年 1222 天）：板块同日联动 IC 0.6~0.8，但同伴早盘走势
+    对 TCL 剩余时段预测力≈0；唯一显著信号是隔日反转
+    （同伴昨日涨幅 vs TCL 今日 IC≈-0.07，p=0.015）：
+    同伴昨日大涨 → 今日谨防回调（买入收紧），反之低吸可放宽。
+    任一环节取数失败时优雅降级，不影响主信号。
+    """
+    from data import store
+    from data.fetcher_realtime import fetch_realtime_min
+
+    peers: Dict = {}
+    prev_rets = []
+    for code, name in PEER_NAMES.items():
+        info: Dict = {"name": name}
+        try:
+            d = store.load_bars(code)
+            if d is not None and len(d) >= 2:
+                prev_ret = (float(d["close"].iloc[-1]) / float(d["close"].iloc[-2]) - 1) * 100
+                info["prev_ret"] = round(prev_ret, 2)
+                prev_rets.append(prev_ret)
+            rt = fetch_realtime_min(code, cfg.min_frequency)
+            if not rt.empty:
+                today = rt["date"].max()
+                tb = rt[rt["date"] == today].sort_values("time")
+                if not tb.empty:
+                    open_p = float(tb["open"].iloc[0])
+                    cur = float(tb["close"].iloc[-1])
+                    info["morning_ret"] = round((cur / open_p - 1) * 100, 2)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("同伴 %s 数据获取失败: %s", code, exc)
+        peers[code] = info
+
+    avg_prev = sum(prev_rets) / len(prev_rets) if prev_rets else 0.0
+    if avg_prev >= 2.0:
+        hint = f"板块昨日大涨({avg_prev:+.1f}%)，历史有反转效应，今日买入建议收紧一档"
+    elif avg_prev <= -2.0:
+        hint = f"板块昨日大跌({avg_prev:+.1f}%)，历史有反转效应，今日低位承接可放宽一档"
+    else:
+        hint = ""
+    return {"peers": peers, "avg_prev_ret": round(avg_prev, 2), "reversal_hint": hint}
 
 
 def predict_intraday_signal(
@@ -126,6 +173,33 @@ def predict_intraday_signal(
     # 拟合轨迹：用轨迹解码器预测剩余路径（窗口不足时退化为期望方向+波动带）
     trajectory = _fit_trajectory(code, today_bars, base_pred, vol_info["current"])
 
+    # 综合建议：生产策略决策引擎 + 双账户（影子模拟 + 真实跟踪，walk 验证 +83%）
+    try:
+        from serving.shadow_account import account_path
+        from serving.strategy_advice import run_shadow_flow
+
+        advice = run_shadow_flow(
+            code, current_price,
+            today_open=float(open_price),
+            today=str(pd.Timestamp(today).date()),
+            account_name="shadow",
+        )
+        # 真实账户（存在时才跟踪）
+        if account_path("real").exists():
+            advice_real = run_shadow_flow(
+                code, current_price,
+                today_open=float(open_price),
+                today=str(pd.Timestamp(today).date()),
+                account_name="real",
+            )
+        else:
+            advice_real = None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("策略决策生成失败，降级为网格动作：%s", exc)
+        advice = {"action": grid_info["action"], "reason": grid_info["reason"],
+                  "grid_pos": grid_info["grid_pos"]}
+        advice_real = None
+
     return {
         "code": code,
         "date": str(pd.Timestamp(today).date()),
@@ -142,6 +216,11 @@ def predict_intraday_signal(
         "grid_reason": grid_info["reason"],
         "grid_pos": grid_info["grid_pos"],
         "trajectory": trajectory,
+        "combined_advice": advice,
+        "real_account": (advice_real or {}).get("account"),
+        "real_exec": (advice_real or {}).get("exec"),
+        "real_advice": {k: (advice_real or {}).get(k) for k in
+                        ("action", "reason", "buy_lots", "lot_shares")} if advice_real else None,
     }
 
 
@@ -203,15 +282,6 @@ def format_intraday_message(sig: Dict) -> str:
     open_chg = (sig["current_price"] / sig["open_price"] - 1) * 100 if sig["open_price"] else 0.0
     trend = "上涨" if exp_rest >= 0 else "下跌"
 
-    # 动作颜色
-    act = sig["grid_action"]
-    color = "info" if "买" in act else ("warning" if "卖" in act else "comment")
-
-    # 网格位置口语化：pos = 当前价下方的格数（共 10 格），格数越多价越低
-    grid_n = cfg.bt_grid_n
-    pos = sig["grid_pos"]
-    pos_desc = f"价格处于 {grid_n} 格网格的第 {round(pos)} 格（越低越适合买）"
-
     lines = [
         f"**{sig['code']} 盘中参考**（{sig['date']} {sig['time']}）",
         f"> 现价: {sig['current_price']} 元（开盘 {sig['open_price']} 元，已{open_chg:+.2f}%）",
@@ -220,9 +290,72 @@ def format_intraday_message(sig: Dict) -> str:
         f"> 今天剩余时间: 预计{trend} {abs(exp_rest):.2f}%，"
         f"收盘大约 {exp_close:.2f} 元（上下浮动 {band:.2f}%）",
         f"> 盘面波动: {sig['vol_level']}（近期波动排在 {sig['vol_pctile']:.0%} 位置）",
-        f"> 网格操作建议: <font color=\"{color}\">{act}</font>",
-        f"> {sig['grid_reason']}；{pos_desc}",
     ]
+    # 综合建议（生产策略：深跌加倍 + logistic 门控 + 延迟卖出）
+    advice = sig.get("combined_advice")
+    if advice:
+        a_color = "info" if "买" in advice.get("action", "") else (
+            "warning" if "卖" in advice.get("action", "") else "comment")
+        gate_txt = {
+            True: "门控放行", False: "门控拦截", None: "门控未就绪",
+        }.get(advice.get("gate_allow"), "门控未就绪")
+        pred_txt = (
+            f"未来5日 {advice['base_pred']:+.2f}%"
+            if advice.get("base_pred") is not None else "基座未就绪"
+        )
+        lines.append(
+            f"> 策略建议: <font color=\"{a_color}\">{advice.get('action', '观望')}</font>"
+            f"（{advice.get('reason', '')}）"
+        )
+        lines.append(
+            f"> 决策依据: 网格第 {advice.get('grid_pos', '-')} 格"
+            f"({advice.get('grid_range', '')}) | {pred_txt} | {gate_txt}"
+        )
+        # 影子账户状态（策略模拟验证）
+        acct = advice.get("account")
+        if acct:
+            pos_txt = (
+                f"持仓 {acct['n_lots']} 格(成本 {acct['avg_cost']}) 浮盈 {acct['unrealized_pct']:+.1f}%"
+                if acct['n_lots'] else "空仓"
+            )
+            win_txt = f" | 胜率 {acct['win_rate']:.0f}%" if acct.get('win_rate') is not None else ""
+            lines.append(
+                f"> 影子账户: 总资产 {acct['equity']/10000:.2f}万"
+                f"(收益 {acct['total_return_pct']:+.1f}%) | 现金 {acct['cash']/10000:.2f}万 | {pos_txt}"
+                f" | 已实现盈亏 {acct['realized_pnl']:+,.0f}元{win_txt}"
+            )
+        # 真实账户：只推送策略建议与执行动作，不展示资金数额
+        racc = sig.get("real_account")
+        if racc:
+            if sig.get("real_exec"):
+                lines.append(f"> 真账执行: {sig['real_exec'].replace('开盘执行: ', '')}")
+            radv = sig.get("real_advice")
+            if radv:
+                r_act = radv.get("action", "观望")
+                r_color = "info" if "买" in r_act else (
+                    "warning" if "卖" in r_act else "comment")
+                r_lot = radv.get("lot_shares")
+                r_lot_txt = f"，每格约 {r_lot} 股" if r_lot else ""
+                lines.append(f"> 真账建议: <font color=\"{r_color}\">{r_act}</font>"
+                             f"（{radv.get('reason', '')}{r_lot_txt}）")
+        # 开盘执行结果
+        if advice.get("exec"):
+            lines.append(f"> {advice['exec']}")
+        # 波段计划（具体挂单价位 + 股数）
+        swing = []
+        lot_shares = advice.get("lot_shares")
+        lot_txt = f"(约 {lot_shares} 股)" if lot_shares else ""
+        if advice.get("sell_trigger") and acct and acct.get("n_lots"):
+            swing.append(f"反弹至 {advice['sell_trigger']} 卖 1 格{lot_txt}")
+        if advice.get("buy_trigger"):
+            if advice.get("action") == "深跌加倍买入":
+                n_buy, hint = 2, "加倍"
+            else:
+                n_buy, hint = 1, ""
+            lots_txt = f"(约 {lot_shares * n_buy} 股)" if lot_shares else ""
+            swing.append(f"回落至 {advice['buy_trigger']} 买 {n_buy} 格{hint}{lots_txt}")
+        if swing:
+            lines.append(f"> 波段计划: {' | '.join(swing)}")
     return "\n".join(lines)
 
 

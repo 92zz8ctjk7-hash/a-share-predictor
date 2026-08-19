@@ -620,6 +620,8 @@ def cmd_rl_backtest(args) -> None:
             dqn_epochs=args.dqn_epochs if args.dqn_epochs else 5,
             include_hybrid=args.with_hybrid,
             trend_th=args.trend_th if args.trend_th is not None else 0.03,
+            dynamic_lot=args.dynamic_lot,
+            use_capital_plan=args.capital_plan,
         )
         if report.empty:
             return
@@ -860,6 +862,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="walk 模式启用混合门控（regime 切换：震荡用 DQN、趋势用 logistic，自动启用 DQN）")
     p_rl.add_argument("--trend-th", type=float,
                       help="混合门控趋势判定阈值 |idx_ret_20d|（默认 0.03）")
+    p_rl.add_argument("--dynamic-lot", action="store_true",
+                      help="每格股数按当前总资产动态重算（权重恒定，复利效应）")
+    p_rl.add_argument("--capital-plan", action="store_true",
+                      help="启用分层资金计划（盈利复利放大 + 相对/绝对双回撤刹车）")
     p_rl.set_defaults(func=cmd_rl_backtest)
 
     # train
