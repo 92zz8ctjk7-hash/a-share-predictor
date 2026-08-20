@@ -137,6 +137,14 @@ def predict_intraday_signal(
         logger.warning("%s 无实时分钟数据", code)
         return None
     today = rt["date"].max()
+    # 新鲜度守卫：实时源未同步到今天（开盘初期数据源延迟是常态）时跳过，
+    # 避免把昨日盘中参考当作今日推送（与 predict_intraday 同款守卫）
+    if pd.Timestamp(today).date() != date.today():
+        logger.warning(
+            "%s 实时分钟源最新交易日为 %s（非今天），跳过盘中参考避免推送过期内容",
+            code, pd.Timestamp(today).date(),
+        )
+        return None
     today_bars = rt[rt["date"] == today].sort_values("time")
     if today_bars.empty:
         return None

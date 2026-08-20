@@ -47,7 +47,7 @@ def format_signal_message(signal: dict) -> str:
     advice = "可以买入" if bullish else "只卖不买，先别加仓"
     return (
         f"**{signal['code']} 盘中信号**\n"
-        f"> 今天 {signal['date']}，10:00 最新价 {signal['price_at_1000']} 元\n"
+        f"> 今天 {signal['date']}，9:50 最新价 {signal['price_at_1000']} 元\n"
         f"> 模型判断：未来 30 分钟大概率{direction}，"
         f"到 {signal['predicted_close']} 元左右（{chg:+.2f}%）\n"
         f"> 上涨把握：{prob_pct}%\n"

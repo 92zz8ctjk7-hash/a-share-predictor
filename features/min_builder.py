@@ -31,9 +31,12 @@ from features.builder import (
 
 logger = logging.getLogger(__name__)
 
-# 10:00 截面：10:00 前（含）的 bar 数量（09:35/09:40/09:45/09:50/09:55/10:00）
-SEQ_LEN = 6
-CUTOFF_TIME = "10:00"
+# 9:50 截面：9:50 前（含）的 bar 数量（09:35/09:40/09:45/09:50）
+# 输入窗口 4 根（20 分钟信息，实验验证与 6 根版 AUC 相当且提前 10 分钟出信号）
+SEQ_LEN = 4
+CUTOFF_TIME = "09:50"
+# 标签跨度：预测截面后未来 30 分钟（6 根 bar）
+LABEL_BARS = 6
 
 # 每根 bar 的 4 维序列特征
 SEQ_FEATURES: List[str] = ["ret", "vs_open", "vol_ratio", "amplitude"]
@@ -290,9 +293,9 @@ def build_min_samples(
     return built
 
 
-# ---- 滚动窗口样本：当前 30 分钟窗口 → 预测下一个 30 分钟涨跌 ----
+# ---- 滚动窗口样本：当前 20 分钟窗口（4 根 bar）→ 预测下一个 30 分钟涨跌 ----
 
-# 滚动步长 = 窗口长度（6 根 bar = 30 分钟，不重叠），每天约 7 条样本
+# 滚动步长 = 输入窗口长度（4 根 bar = 20 分钟，不重叠），每天约 12 条样本
 ROLL_STEP = SEQ_LEN
 
 
@@ -345,9 +348,9 @@ def build_roll_samples(
     base_preds: Optional[pd.DataFrame] = None,
     with_market: bool = True,
 ) -> Optional[pd.DataFrame]:
-    """构造滚动窗口分钟样本：当前 30 分钟窗口预测下一个 30 分钟涨跌。
+    """构造滚动窗口分钟样本：当前 20 分钟窗口（4 根 bar）预测下一个 30 分钟涨跌。
 
-    - 滚动步长 6 根 bar（30 分钟，不重叠），每天约 7 条样本
+    - 滚动步长 4 根 bar（20 分钟，不重叠），每天约 12 条样本
     - 标签 label_rest：下一窗口末 bar 收盘 / 当前窗口末 bar 收盘 - 1（%）
     - 静态特征：T-1 日线 + 压力位 + base_pred，不注入宏观/基本面特征
     - with_market=True 时注入市场环境特征（指数环境+日历，T 日收盘可得），
@@ -386,7 +389,7 @@ def build_roll_samples(
     for d, g in min_df.groupby("date"):
         g = g.sort_values("time").reset_index(drop=True)
         n = len(g)
-        if n < SEQ_LEN * 2:
+        if n < SEQ_LEN + LABEL_BARS:
             continue  # 不足以构成一个窗口 + 预测目标
         if d not in daily_lookup.index or d not in daily_raw.index:
             continue
@@ -403,9 +406,9 @@ def build_roll_samples(
             continue  # 无基座预测的日期不构造样本（与日线样本一致）
         base_pred = float(hit.iloc[0])
 
-        for start in range(0, n - SEQ_LEN * 2 + 1, ROLL_STEP):
+        for start in range(0, n - SEQ_LEN - LABEL_BARS + 1, ROLL_STEP):
             win_close = float(g["close"].iloc[start + SEQ_LEN - 1])
-            tgt_close = float(g["close"].iloc[start + SEQ_LEN * 2 - 1])
+            tgt_close = float(g["close"].iloc[start + SEQ_LEN + LABEL_BARS - 1])
             if win_close <= 0:
                 continue
             label_rest = (tgt_close / win_close - 1.0) * 100.0
@@ -537,7 +540,7 @@ def build_predict_input(
     )
     if len(g10) < SEQ_LEN:
         logger.error(
-            "交易日 %s 的 10:00 截面不足 %d 根 bar（请 10:00 后运行）",
+            "交易日 %s 的 09:50 截面不足 %d 根 bar（请 09:50 后运行）",
             T.date(), SEQ_LEN,
         )
         return None

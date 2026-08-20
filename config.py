@@ -70,8 +70,8 @@ class Config:
     bt_save_every: int = 10                 # 训练 checkpoint 间隔（epoch）
 
     # ---- L5 预测输出 / 定时服务 ----
-    schedule_hour: int = 10                 # launchd 调度小时（盘中 10:00 截面后）
-    schedule_minute: int = 1                # launchd 调度分钟
+    schedule_hour: int = 9                  # launchd 调度小时（09:50 截面后）
+    schedule_minute: int = 51               # launchd 调度分钟（09:50 bar 收盘留 1 分钟同步余量）
     train_hour: int = 8                     # 增量训练调度小时（开盘前）
     train_minute: int = 30                  # 增量训练调度分钟
     push_enabled: bool = True               # 是否推送信号
