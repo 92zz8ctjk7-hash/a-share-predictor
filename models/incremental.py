@@ -103,6 +103,45 @@ def _train_base_window(sample, window_spec, model_name, epochs, resume) -> Tuple
     return len(sub), bundle
 
 
+def _train_nextday_window(sample, window_spec, epochs, resume) -> Tuple[int, object]:
+    """训练次日预测模型（horizon=1），保存为 lstm_nextday.pt。
+
+    样本标签从 close 列推导次日收益（不复用 horizon=5 的 label_reg）：
+    label_1d = close[t+1]/close[t] - 1（按股票分组）。特征/窗口/标准化与基座一致，
+    故标准化参数与基座相同（同特征同日期切分），推理复用同一 scaler。
+    """
+    from features.dataset import build_bundle
+    from models.train import save_model, train_model
+
+    offset = _parse_window(window_spec)
+    max_date = sample["date"].max()
+    cutoff = max_date - offset
+    sub = sample[sample["date"] >= cutoff].reset_index(drop=True).copy()
+
+    # 次日标签：按股票分组，次日收盘/当日收盘 - 1（%）
+    sub = sub.sort_values(["code", "date"]).reset_index(drop=True)
+    nxt_close = sub.groupby("code")["close"].shift(-1)
+    sub["label_reg"] = (nxt_close / sub["close"] - 1) * 100.0
+    sub["label_cls"] = (sub["label_reg"] > 0).astype(int)
+    sub = sub.dropna(subset=["label_reg"]).reset_index(drop=True)
+    logger.info("次日模型窗口训练：近 %s（%s 起）%d 条样本", window_spec, cutoff.date(), len(sub))
+
+    bundle = build_bundle(
+        sub, train_ratio=cfg.train_ratio, valid_ratio=cfg.valid_ratio,
+        seq_len=cfg.seq_len, mode="seq",
+        persist_scaler=False,  # 复用基座同一份标准化（同特征同切分）
+    )
+    eff_cfg = _eff_cfg("lstm", epochs)
+    init_state = _maybe_load_state(resume, DATA_DIR / "models" / "lstm_nextday.pt")
+    try:
+        model_info = train_model(bundle, eff_cfg, init_state_dict=init_state)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("warm-start 失败（%s），从头训练", exc)
+        model_info = train_model(bundle, eff_cfg)
+    save_model(model_info, str(DATA_DIR / "models" / "lstm_nextday.pt"))
+    return len(sub), bundle
+
+
 def _train_min_window(min_sample, window_spec, frequency, epochs, resume) -> int:
     """窗口过滤滚动分钟样本训练 IntradayLSTM 并保存，返回窗口样本数。
 
@@ -185,15 +224,22 @@ def run_incremental_update(
     today = date.today().isoformat()
     base_codes = _load_base_codes()
     aux_codes = [c for c in cfg.min_aux_codes if c not in codes]
+    # 板块反转参考股（仅刷日线，不参与训练）
+    from serving.intraday_signal import PEER_NAMES
+
+    peer_codes = [
+        c for c in PEER_NAMES
+        if c not in base_codes and c not in aux_codes and c not in codes
+    ]
     summary: Dict = {}
 
     # 1. 数据刷新（串行 baostock，避免会话互踢）
     logger.info(
-        "[1/6] 刷新数据：基座 %d 只日线 + %d 只分钟线（含辅助股 %d 只）",
-        len(base_codes), len(codes) + len(aux_codes), len(aux_codes),
+        "[1/6] 刷新数据：基座 %d 只日线 + %d 只分钟线（含辅助股 %d 只）+ 板块参考股 %d 只日线",
+        len(base_codes), len(codes) + len(aux_codes), len(aux_codes), len(peer_codes),
     )
     with BaoStockClient() as client:
-        for c in base_codes + aux_codes:
+        for c in base_codes + aux_codes + peer_codes:
             try:
                 fetch_stock(c, cfg.start_date, today, frequency="d", adjust=cfg.adjust,
                             use_cache=True, refresh=True, client=client)
@@ -216,6 +262,13 @@ def run_incremental_update(
     sample = store.load_all_samples()
     n_base, bundle = _train_base_window(sample, base_window, base_model, base_epochs, resume)
     summary["base_window_samples"] = n_base
+
+    # 3.5 次日预测模型（horizon=1，供隔夜推送）
+    try:
+        n_nextday, _ = _train_nextday_window(sample, base_window, base_epochs, resume)
+        summary["nextday_samples"] = n_nextday
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("次日模型训练失败（不影响主流程）: %s", exc)
 
     # 4. base-predict
     logger.info("[4/6] 基座推理生成 base_preds")

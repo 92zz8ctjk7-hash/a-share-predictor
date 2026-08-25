@@ -580,6 +580,68 @@ def cmd_serve_intraday(args) -> None:
             push_intraday_signal(sig)
 
 
+def cmd_serve_guard(args) -> None:
+    """补跑守护：当天未推送过信号时补跑（主任务错过时的兑底）。
+
+    幂等：信号库已有当日记录则跳过；时窗外（非 9:51~11:30）直接退出。
+    """
+    from datetime import date, datetime, time as dtime
+
+    import pandas as pd
+
+    from serving.signal_store import load_signals
+
+    now = datetime.now()
+    if not (dtime(9, 51) <= now.time() <= dtime(11, 30)):
+        logger.info("不在补跑时窗（9:51~11:30），退出")
+        return
+
+    today = str(date.today())
+    try:
+        df = load_signals()
+        if df is not None and not df.empty:
+            pushed = set(pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d"))
+            if today in pushed:
+                logger.info("今日已推送过信号，跳过补跑")
+                return
+    except FileNotFoundError:
+        pass
+
+    logger.info("今日尚未推送信号，启动补跑")
+    from serving.scheduler import run_daily_job
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    run_daily_job(codes, frequency=args.frequency)
+    # 盘中参考链路同样补推（复用 serve-intraday 逻辑，强制推送）
+    args.no_push = False
+    cmd_serve_intraday(args)
+
+
+def cmd_install_guard_scheduler(args) -> None:
+    """安装补跑守护定时任务：主任务错过时（休眠/开机晚）自动补推。"""
+    from serving.scheduler import install_guard_scheduler
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    install_guard_scheduler(codes, load=args.load)
+
+
+def cmd_nextday_push(args) -> None:
+    """次日预判：用次日模型预测明日涨跌并推送（隔夜推送，早盘前）。"""
+    from serving.scheduler import run_nextday_job
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    results = run_nextday_job(codes, dry_run=args.dry_run)
+    logger.info("nextday-push 完成：%d 个信号", len(results))
+
+
+def cmd_install_nextday_scheduler(args) -> None:
+    """安装次日预判定时任务：工作日早盘前（08:40）推送明日预判。"""
+    from serving.scheduler import install_nextday_scheduler
+
+    codes = parse_codes(args.codes) if args.codes else ["sz.000100"]
+    install_nextday_scheduler(codes, load=args.load)
+
+
 def cmd_install_intraday_scheduler(args) -> None:
     """安装盘中信号定时任务（交易日 10:01 推送）。"""
     from serving.scheduler import install_intraday_scheduler
@@ -769,6 +831,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_is.add_argument("--load", action="store_true",
                       help="安装后立即 launchctl load 启用")
     p_is.set_defaults(func=cmd_install_scheduler)
+
+    # serve-guard（补跑守护：主任务错过时补推）
+    p_sg = sub.add_parser("serve-guard", help="补跑守护：当天未推送过信号时补跑")
+    p_sg.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_sg.add_argument("--frequency", type=str, choices=["5", "15", "30", "60"],
+                      help="分钟线频率（默认 5）")
+    p_sg.set_defaults(func=cmd_serve_guard)
+
+    # install-guard-scheduler（安装补跑守护定时任务）
+    p_ig = sub.add_parser("install-guard-scheduler", help="安装补跑守护定时任务")
+    p_ig.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_ig.add_argument("--load", action="store_true",
+                      help="安装后立即 launchctl load 启用")
+    p_ig.set_defaults(func=cmd_install_guard_scheduler)
+
+    # nextday-push（次日预判：隔夜推送）
+    p_nd = sub.add_parser("nextday-push", help="次日预判：预测明日涨跌并推送（早盘前）")
+    p_nd.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_nd.add_argument("--dry-run", action="store_true", help="只打印不推送")
+    p_nd.set_defaults(func=cmd_nextday_push)
+
+    # install-nextday-scheduler（安装次日预判定时任务）
+    p_ind = sub.add_parser("install-nextday-scheduler", help="安装次日预判定时任务")
+    p_ind.add_argument("--codes", type=str, help="股票代码，逗号分隔（默认 sz.000100）")
+    p_ind.add_argument("--load", action="store_true",
+                       help="安装后立即 launchctl load 启用")
+    p_ind.set_defaults(func=cmd_install_nextday_scheduler)
 
     # backtest（多窗口网格交易回测）
     p_bt = sub.add_parser("backtest", help="多窗口网格交易回测（含模型训练与 checkpoint）")

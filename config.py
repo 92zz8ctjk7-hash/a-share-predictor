@@ -74,6 +74,8 @@ class Config:
     schedule_minute: int = 51               # launchd 调度分钟（09:50 bar 收盘留 1 分钟同步余量）
     train_hour: int = 8                     # 增量训练调度小时（开盘前）
     train_minute: int = 30                  # 增量训练调度分钟
+    nextday_hour: int = 8                   # 次日预判推送小时（早盘前，08:30 训练后）
+    nextday_minute: int = 40                # 次日预判推送分钟（开盘 09:30 前）
     push_enabled: bool = True               # 是否推送信号
     push_channel: str = "auto"              # 推送渠道：auto/wecom/pushplus
     wecom_webhook: str = ""                 # 建议用 cache/.env 的 WECOM_WEBHOOK 配置

@@ -293,6 +293,48 @@ def build_min_samples(
     return built
 
 
+# ---- 日内特征（供次日预测模型）：尾盘动量 + 日内波动率 ----
+
+# 日内特征列名（加入次日模型，收盘后即可计算，无未来泄漏）
+INTRADAY_FEATURE_COLUMNS: List[str] = ["eod_momentum", "intraday_vol"]
+
+
+def compute_intraday_features(
+    code: str,
+    frequency: str = "5",
+) -> Optional[pd.DataFrame]:
+    """从分钟线计算每日日内特征，返回 (date, eod_momentum, intraday_vol)。
+
+    - eod_momentum（尾盘动量）：当日最后 30 分钟涨跌幅 =
+      close(最后一根)/close(倒数第 6 根) - 1（%）。尾盘强弱常延续到次日。
+    - intraday_vol（日内波动率）：当日分钟收益的标准差（%）。
+      高波动日次日延续高波动的概率更高。
+    只用当日已收盘数据，无未来信息。无分钟数据返回 None。
+    """
+    min_df = store.load_min_bars(code, frequency)
+    if min_df is None or min_df.empty:
+        return None
+
+    rows = []
+    for d, g in min_df.groupby("date"):
+        g = g.sort_values("time").reset_index(drop=True)
+        if len(g) < 7:  # 尾盘动量需至少 6 根间隔（首尾各 1 + 中间 5）
+            continue
+        closes = g["close"].to_numpy(dtype=np.float64)
+        # 尾盘动量：最后 30 分钟（6 根）
+        eod_momentum = (closes[-1] / closes[-6] - 1) * 100.0
+        # 日内波动率：分钟收益标准差（%）
+        rets = np.diff(closes) / closes[:-1] * 100.0
+        intraday_vol = float(np.std(rets)) if len(rets) > 1 else 0.0
+        rows.append({"date": d, "eod_momentum": eod_momentum, "intraday_vol": intraday_vol})
+
+    if not rows:
+        return None
+    out = pd.DataFrame(rows)
+    out["date"] = pd.to_datetime(out["date"])
+    return out.sort_values("date").reset_index(drop=True)
+
+
 # ---- 滚动窗口样本：当前 20 分钟窗口（4 根 bar）→ 预测下一个 30 分钟涨跌 ----
 
 # 滚动步长 = 输入窗口长度（4 根 bar = 20 分钟，不重叠），每天约 12 条样本

@@ -20,8 +20,10 @@ from config import DATA_DIR, cfg
 
 logger = logging.getLogger(__name__)
 
-# 板块同伴（面板板块，仅展示与反转提示，不参与 serving 预测）
-PEER_NAMES = {"sz.000725": "京东方A", "sh.600707": "彩虹股份"}
+# 板块同伴（面板 + TCL 系，展示与反转提示，不参与 serving 预测）
+# TCL中环隔日反转 IC -0.090（p=0.002）为三同伴中最强
+PEER_NAMES = {"sz.000725": "京东方A", "sh.600707": "彩虹股份",
+              "sz.002129": "TCL中环"}
 
 # 强度档位（已实现波动率分位）
 VOL_LOW_TH = 0.33   # 低于 33 分位 = 低波
@@ -181,6 +183,9 @@ def predict_intraday_signal(
     # 拟合轨迹：用轨迹解码器预测剩余路径（窗口不足时退化为期望方向+波动带）
     trajectory = _fit_trajectory(code, today_bars, base_pred, vol_info["current"])
 
+    # 板块同伴动态（展示 + 反转提示，含策略收紧/放宽）
+    peer_ctx = _peer_context()
+
     # 综合建议：生产策略决策引擎 + 双账户（影子模拟 + 真实跟踪，walk 验证 +83%）
     try:
         from serving.shadow_account import account_path
@@ -191,6 +196,7 @@ def predict_intraday_signal(
             today_open=float(open_price),
             today=str(pd.Timestamp(today).date()),
             account_name="shadow",
+            peer_avg_prev=peer_ctx.get("avg_prev_ret"),
         )
         # 真实账户（存在时才跟踪）
         if account_path("real").exists():
@@ -199,6 +205,7 @@ def predict_intraday_signal(
                 today_open=float(open_price),
                 today=str(pd.Timestamp(today).date()),
                 account_name="real",
+                peer_avg_prev=peer_ctx.get("avg_prev_ret"),
             )
         else:
             advice_real = None
@@ -224,6 +231,7 @@ def predict_intraday_signal(
         "grid_reason": grid_info["reason"],
         "grid_pos": grid_info["grid_pos"],
         "trajectory": trajectory,
+        "peer_context": peer_ctx,
         "combined_advice": advice,
         "real_account": (advice_real or {}).get("account"),
         "real_exec": (advice_real or {}).get("exec"),
@@ -299,6 +307,20 @@ def format_intraday_message(sig: Dict) -> str:
         f"收盘大约 {exp_close:.2f} 元（上下浮动 {band:.2f}%）",
         f"> 盘面波动: {sig['vol_level']}（近期波动排在 {sig['vol_pctile']:.0%} 位置）",
     ]
+    # 板块同伴动态（面板+TCL系三股联动参考）
+    peer_ctx = sig.get("peer_context") or {}
+    peers = peer_ctx.get("peers") or {}
+    if peers:
+        parts = []
+        for info in peers.values():
+            pr = info.get("prev_ret")
+            seg = info["name"]
+            if pr is not None:
+                seg += f" 昨{pr:+.2f}%"
+            parts.append(seg)
+        lines.append(f"> 板块参考: {'、'.join(parts)}")
+        if peer_ctx.get("reversal_hint"):
+            lines.append(f"> 板块动态: {peer_ctx['reversal_hint']}")
     # 综合建议（生产策略：深跌加倍 + logistic 门控 + 延迟卖出）
     advice = sig.get("combined_advice")
     if advice:

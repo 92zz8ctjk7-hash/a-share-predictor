@@ -31,6 +31,11 @@ SKIP_GRIDS = 2                  # 深跌加倍：跳过浅跌格数
 DOUBLE_MULT = 2                 # 深跌区每格筹码倍数
 DEFER_TH = 0.02                 # 延迟卖出阈值（未来 5 日预测 > +2%）
 
+# 板块反转调节阈值（同伴昨日均涨≥2% 买入收紧一档 / ≤-2% 放宽一档）
+# 实证：京东方 IC-0.070/彩虹-0.053/TCL中环-0.090（三股隔日反转均显著）
+PEER_TIGHTEN_TH = 2.0
+PEER_LOOSEN_TH = -2.0
+
 
 def _grid_level(price: float, base_price: float) -> Dict:
     """网格位置：格数（0=上界, GRID_N=下界）、区域、上下界、格线间距。"""
@@ -95,12 +100,13 @@ def _gate_allow(code: str) -> Optional[bool]:
 
 
 def decide(code: str, price: float, anchor: Optional[float] = None,
-           n_lots_held: int = 0) -> Dict:
+           n_lots_held: int = 0, peer_avg_prev: Optional[float] = None) -> Dict:
     """生成当日策略决策，返回含 action/依据/波段计划的 dict。
 
     price ：当前价（盘中实时价或最新收盘价）
     anchor：网格锚定价（影子账户建仓日锁定）；None 时用最新收盘价
     n_lots_held：当前持仓格数（无持仓时卖出类动作降级为观望）
+    peer_avg_prev：板块同伴昨日均涨跌(%)，≥+2% 买入收紧一档、≤-2% 放宽一档
     """
     from data import store
 
@@ -148,6 +154,19 @@ def decide(code: str, price: float, anchor: Optional[float] = None,
             buy_lots = 1
             reason = f"第 {pos} 格，网格正常低吸 1 格"
 
+        # 板块反转调节（隔日反转效应：同伴昨日大涨则今日偏弱）
+        if peer_avg_prev is not None and action in ("深跌加倍买入", "正常买入"):
+            if peer_avg_prev >= PEER_TIGHTEN_TH:
+                if action == "深跌加倍买入":
+                    action, buy_lots = "正常买入", 1
+                else:
+                    action, buy_lots = "观望", 0
+                reason += f"；板块昨涨{peer_avg_prev:+.1f}%，收紧一档"
+            elif peer_avg_prev <= PEER_LOOSEN_TH:
+                if action == "正常买入":
+                    action, buy_lots = "深跌加倍买入", DOUBLE_MULT
+                reason += f"；板块昨跌{peer_avg_prev:+.1f}%，放宽一档"
+
     # 波段计划：上一格线（反弹卖出位）/ 下一格线（回落买入位）
     upper_line = round(grid["upper"] - (pos - 1) * step, 2) if pos > 0 else None
     lower_line = round(grid["upper"] - (pos + 1) * step, 2) if pos < GRID_N else None
@@ -175,11 +194,13 @@ def run_shadow_flow(
     today_open: Optional[float] = None,
     today: Optional[str] = None,
     account_name: str = "shadow",
+    peer_avg_prev: Optional[float] = None,
 ) -> Dict:
     """账户每日执行流：先执行昨日决策（今日开盘价），再生成今日决策。
 
     与回测同撮合语义：T 日决策 → T+1 开盘成交。首次建仓时锁定网格锚定价，
     清仓止盈后重置锚定。account_name：shadow=影子账户 / real=真实账户。
+    peer_avg_prev：板块同伴昨日均涨跌(%)，用于买入档位收紧/放宽。
     返回扩展 advice（含账户快照、分日收益与执行结果）。
     """
     from serving.shadow_account import ShadowAccount
@@ -218,6 +239,7 @@ def run_shadow_flow(
         code, current_price,
         anchor=acc.grid_anchor,
         n_lots_held=len(acc.lots),
+        peer_avg_prev=peer_avg_prev,
     )
     # 每格具体股数：已锁定用锁定值，否则按账户规模估算（初始资金/10格/现价，取整手）
     if acc.lot_shares is not None:
